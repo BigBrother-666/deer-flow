@@ -649,6 +649,14 @@ tool_groups:
   - name: file:write
   - name: bash
   - name: browser
+  # Pterodactyl panel integration (Minecraft server maintenance).
+  # Shared connection settings for every pterodactyl_* tool. Mutating tools
+  # (power/file/backup/startup) are hard-gated by human confirmation; enable
+  # the guard middleware in extensions_config.json (see below).
+  # - name: pterodactyl
+  #   panel_url: $PTERODACTYL_PANEL_URL   # e.g. https://panel.example.com
+  #   api_key: $PTERODACTYL_API_KEY       # Client API key (ptlc_...); use $VAR, never inline
+  #   timeout: 30
 
 # ============================================================================
 # Tools Configuration
@@ -989,6 +997,60 @@ tools:
   - name: bash
     group: bash
     use: deerflow.sandbox.tools:bash_tool
+
+  # ---- Pterodactyl panel: read-only tools (execute directly) ----
+  # Connection settings come from the `pterodactyl` tool group above.
+  # - name: pterodactyl_list_servers
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:list_servers_tool
+  # - name: pterodactyl_get_server
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:get_server_tool
+  # - name: pterodactyl_get_resources
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:get_resources_tool
+  # - name: pterodactyl_list_files
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:list_files_tool
+  # - name: pterodactyl_read_file
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:read_file_tool
+  # - name: pterodactyl_list_backups
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:list_backups_tool
+  # - name: pterodactyl_get_startup
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:get_startup_tool
+  # ---- Pterodactyl mutating tools (HARD-GATED by human confirmation) ----
+  # These only run after the user confirms via a clarification card. Requires
+  # PterodactylGuardMiddleware enabled in extensions_config.json.
+  # - name: pterodactyl_power_action
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:power_action_tool
+  # - name: pterodactyl_send_command
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:send_command_tool
+  # - name: pterodactyl_write_file
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:write_file_tool
+  # - name: pterodactyl_rename_file
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:rename_file_tool
+  # - name: pterodactyl_delete_file
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:delete_file_tool
+  # - name: pterodactyl_create_backup
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:create_backup_tool
+  # - name: pterodactyl_restore_backup
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:restore_backup_tool
+  # - name: pterodactyl_delete_backup
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:delete_backup_tool
+  # - name: pterodactyl_update_startup_variable
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:update_startup_variable_tool
 
 # ============================================================================
 # Tool Search Configuration (Deferred Tool Loading)

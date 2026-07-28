@@ -1,5 +1,7 @@
 {
-  "middlewares": [],
+  "middlewares": [
+    "deerflow.community.pterodactyl.guard:PterodactylGuardMiddleware"
+  ],
   "mcpInterceptors": [
     "my_package.mcp.auth:build_auth_interceptor"
   ],
