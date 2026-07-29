@@ -47,11 +47,35 @@ async def test_power_action_rejects_bad_signal(capture):
 
 
 @pytest.mark.anyio
-async def test_send_command_posts(capture):
+async def test_send_command_fire_and_forget_posts(capture):
     calls = capture()
-    await tools.send_command_tool.ainvoke({"server_id": "s", "command": "say hi"})
+    await tools.send_command_tool.ainvoke({"server_id": "s", "command": "say hi", "capture_output": False})
     assert calls[0]["path"] == "/servers/s/command"
     assert calls[0]["json"] == {"command": "say hi"}
+
+
+@pytest.mark.anyio
+async def test_send_command_captures_output(monkeypatch):
+    async def _capture(server_id, command, *, origin, **kwargs):
+        assert command == "list"
+        return ["There are 2 of a max of 20 players online:", "steve, alex"]
+
+    monkeypatch.setattr(tools, "run_command_capture", _capture)
+    monkeypatch.setattr(tools, "load_config", lambda: type("C", (), {"panel_url": "https://p"})())
+    result = await tools.send_command_tool.ainvoke({"server_id": "s", "command": "list"})
+    assert "2 of a max of 20" in result
+    assert "steve, alex" in result
+
+
+@pytest.mark.anyio
+async def test_send_command_capture_no_output(monkeypatch):
+    async def _capture(server_id, command, *, origin, **kwargs):
+        return []
+
+    monkeypatch.setattr(tools, "run_command_capture", _capture)
+    monkeypatch.setattr(tools, "load_config", lambda: type("C", (), {"panel_url": "https://p"})())
+    result = await tools.send_command_tool.ainvoke({"server_id": "s", "command": "noisyless"})
+    assert "no output captured" in result
 
 
 @pytest.mark.anyio
@@ -79,28 +103,6 @@ async def test_delete_file_payload(capture):
     await tools.delete_file_tool.ainvoke({"server_id": "s", "file_path": "world/session.lock"})
     assert calls[0]["path"] == "/servers/s/files/delete"
     assert calls[0]["json"] == {"root": "/", "files": ["world/session.lock"]}
-
-
-@pytest.mark.anyio
-async def test_create_backup_returns_uuid(capture):
-    capture({"attributes": {"uuid": "u-1"}})
-    result = await tools.create_backup_tool.ainvoke({"server_id": "s", "name": "pre-update"})
-    assert "u-1" in result
-
-
-@pytest.mark.anyio
-async def test_restore_backup_path(capture):
-    calls = capture()
-    await tools.restore_backup_tool.ainvoke({"server_id": "s", "backup_uuid": "u-1"})
-    assert calls[0]["path"] == "/servers/s/backups/u-1/restore"
-
-
-@pytest.mark.anyio
-async def test_delete_backup_uses_delete_method(capture):
-    calls = capture()
-    await tools.delete_backup_tool.ainvoke({"server_id": "s", "backup_uuid": "u-1"})
-    assert calls[0]["method"] == "DELETE"
-    assert calls[0]["path"] == "/servers/s/backups/u-1"
 
 
 @pytest.mark.anyio

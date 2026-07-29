@@ -35,7 +35,7 @@ class PterodactylAuthError(PterodactylAPIError):
 
 
 class PterodactylNotFoundError(PterodactylAPIError):
-    """Raised on 404 responses (unknown server, file, or backup)."""
+    """Raised on 404 responses (unknown server or file)."""
 
 
 class PterodactylTimeoutError(PterodactylError):

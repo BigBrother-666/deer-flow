@@ -21,9 +21,6 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         "pterodactyl_write_file",
         "pterodactyl_rename_file",
         "pterodactyl_delete_file",
-        "pterodactyl_create_backup",
-        "pterodactyl_restore_backup",
-        "pterodactyl_delete_backup",
         "pterodactyl_update_startup_variable",
     }
 )
@@ -34,8 +31,6 @@ HIGH_RISK_TOOLS: frozenset[str] = frozenset(
     {
         "pterodactyl_power_action",  # stop/kill can drop players
         "pterodactyl_delete_file",
-        "pterodactyl_restore_backup",
-        "pterodactyl_delete_backup",
     }
 )
 

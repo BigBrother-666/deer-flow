@@ -9,8 +9,12 @@ READ_ONLY_TOOLS = {
     "pterodactyl_get_resources",
     "pterodactyl_list_files",
     "pterodactyl_read_file",
-    "pterodactyl_list_backups",
     "pterodactyl_get_startup",
+    "pterodactyl_read_console",
+    "pterodactyl_read_file_lines",
+    "pterodactyl_search_file",
+    "pterodactyl_download_file",
+    "pterodactyl_query_sqlite",
 }
 
 

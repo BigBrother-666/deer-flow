@@ -90,3 +90,58 @@ async def test_error_is_normalized(mock_request):
     mock_request(handler)
     result = await tools.get_server_tool.ainvoke({"server_id": "bad"})
     assert result.startswith("Error:")
+
+
+@pytest.mark.anyio
+async def test_read_file_lines_windows_output(mock_request):
+    mock_request(lambda *_: "\n".join(f"line{i}" for i in range(10)))
+    result = await tools.read_file_lines_tool.ainvoke({"server_id": "s", "file_path": "/f", "offset": 2, "limit": 3})
+    assert "[lines 2-5 of 10]" in result
+    assert "line2" in result and "line4" in result
+    assert "line5" not in result.split("\n", 1)[1]
+
+
+@pytest.mark.anyio
+async def test_search_file_returns_only_matches(mock_request):
+    body = "ok\nERROR: boom\nok\nerror: again\n"
+    mock_request(lambda *_: body)
+    result = await tools.search_file_tool.ainvoke({"server_id": "s", "file_path": "/log", "pattern": "error"})
+    assert "2: ERROR: boom" in result
+    assert "4: error: again" in result
+    assert "ok" not in result
+
+
+@pytest.mark.anyio
+async def test_search_file_no_matches(mock_request):
+    mock_request(lambda *_: "nothing here")
+    result = await tools.search_file_tool.ainvoke({"server_id": "s", "file_path": "/log", "pattern": "zzz"})
+    assert "no matches" in result
+
+
+@pytest.mark.anyio
+async def test_search_file_invalid_regex(mock_request):
+    mock_request(lambda *_: "x")
+    result = await tools.search_file_tool.ainvoke({"server_id": "s", "file_path": "/log", "pattern": "("})
+    assert result.startswith("Error: invalid search pattern")
+
+
+@pytest.mark.anyio
+async def test_read_console_joins_lines(monkeypatch):
+    async def _fake(server_id, lines, *, origin, **kwargs):
+        return ["a", "b", "c"][-lines:]
+
+    monkeypatch.setattr(tools, "fetch_recent_console", _fake)
+    monkeypatch.setattr(tools, "load_config", lambda: type("C", (), {"panel_url": "https://p"})())
+    result = await tools.read_console_tool.ainvoke({"server_id": "s", "lines": 2})
+    assert result == "b\nc"
+
+
+@pytest.mark.anyio
+async def test_read_console_empty(monkeypatch):
+    async def _fake(server_id, lines, *, origin, **kwargs):
+        return []
+
+    monkeypatch.setattr(tools, "fetch_recent_console", _fake)
+    monkeypatch.setattr(tools, "load_config", lambda: type("C", (), {"panel_url": "https://p"})())
+    result = await tools.read_console_tool.ainvoke({"server_id": "s"})
+    assert "no console output" in result

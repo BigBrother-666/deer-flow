@@ -1,6 +1,6 @@
 ---
 name: minecraft-server-ops
-description: Use this skill when maintaining, diagnosing, or fixing a Minecraft (or other game) server hosted on a Pterodactyl panel. Trigger on requests like "the server is lagging / crashed / won't start", "check server status", "restart the server", "read the crash log", "edit server.properties", "manage plugins", "back up the world", or any troubleshooting of a Pterodactyl-managed game server. Uses the pterodactyl_* tools; all state-changing actions require human confirmation.
+description: Use this skill when maintaining, diagnosing, or fixing a Minecraft (or other game) server hosted on a Pterodactyl panel. Trigger on requests like "the server is lagging / crashed / won't start", "check server status", "restart the server", "read the crash log", "run a console command", "edit server.properties", "manage plugins", or any troubleshooting of a Pterodactyl-managed game server. Uses the pterodactyl_* tools; all state-changing actions require human confirmation.
 ---
 
 # Minecraft Server Ops (Pterodactyl)
@@ -9,8 +9,8 @@ description: Use this skill when maintaining, diagnosing, or fixing a Minecraft 
 
 This skill drives the `pterodactyl_*` tools to operate a game server on a
 Pterodactyl panel: inspect state, read logs and configs, and — after explicit
-human confirmation — perform power actions, edit files, manage backups, and
-adjust startup variables.
+human confirmation — perform power actions, run console commands, edit files,
+and adjust startup variables.
 
 Core principle: **diagnose from read-only evidence first, change the smallest
 thing, verify, and only escalate to destructive actions with confirmation.**
@@ -19,9 +19,8 @@ thing, verify, and only escalate to destructive actions with confirmation.**
 
 Mutating tools (`pterodactyl_power_action`, `pterodactyl_send_command`,
 `pterodactyl_write_file`, `pterodactyl_rename_file`, `pterodactyl_delete_file`,
-`pterodactyl_create_backup`, `pterodactyl_restore_backup`,
-`pterodactyl_delete_backup`, `pterodactyl_update_startup_variable`) are
-hard-gated. A call is BLOCKED until the user confirms.
+`pterodactyl_update_startup_variable`) are hard-gated. A call is BLOCKED until
+the user confirms.
 
 When a mutating tool returns a `BLOCKED:` message containing a
 `[PTERO-CONFIRM:<token>]` marker:
@@ -43,11 +42,25 @@ call needs its own confirmed marker.
 2. **Check state & resources.** `pterodactyl_get_server` (status) and
    `pterodactyl_get_resources` (CPU / memory / disk / uptime). High memory near
    the limit or CPU pinned at 100% points at load or a leak.
-3. **Read the evidence.** `pterodactyl_list_files` on `/logs`, then
-   `pterodactyl_read_file` on `logs/latest.log` (and `crash-reports/` if the
-   server died). Read before theorizing.
-4. **Form one hypothesis**, state it, then act on the smallest fix.
-5. **Verify** after any change: re-read the log / resources and confirm the
+3. **Read the evidence.** `pterodactyl_list_files` on `/logs`, then read
+   `logs/latest.log` (and `crash-reports/` if the server died). Read before
+   theorizing. Prefer targeted reads over dumping whole files:
+   - `pterodactyl_read_console` — the live console's most recent lines (fastest
+     for "what is it printing right now / why did it just crash").
+   - `pterodactyl_search_file` — grep a large log for a keyword/stack-trace
+     before reading around it.
+   - `pterodactyl_read_file_lines` — read a specific line range of a big file.
+   - `pterodactyl_read_file` — small configs read whole (truncates if huge).
+4. **Inspect data/state when needed.**
+   - `pterodactyl_send_command` (confirmed) — run a console command and read its
+     output in one step (e.g. `list`, `tps`, `plugins`). This opens the console
+     socket, sends the command, captures what it prints, and closes.
+   - `pterodactyl_download_file` — pull a file (including binary/DB) into the
+     workspace without loading it into context.
+   - `pterodactyl_query_sqlite` — run a read-only `SELECT` against a downloaded
+     `.db`/`.sqlite` (e.g. a plugin's data store) instead of reading raw bytes.
+5. **Form one hypothesis**, state it, then act on the smallest fix.
+6. **Verify** after any change: re-read the log / resources and confirm the
    symptom is gone.
 
 ## Common scenarios
@@ -77,11 +90,14 @@ call needs its own confirmed marker.
   setting is only read at boot.
 
 ### Before any risky change
-- Take a backup first: `pterodactyl_create_backup` (confirmed) so a
-  `pterodactyl_restore_backup` is available if the change goes wrong.
+- This panel has backups disabled, so there is no automatic rollback. Before
+  overwriting or deleting anything, preserve the current state yourself:
+  `pterodactyl_download_file` the file(s) into the workspace (or copy them aside
+  with `pterodactyl_rename_file`, confirmed) so you can restore by hand if the
+  change goes wrong. Make the smallest reversible change possible.
 
 ## Safety notes
 - Prefer `restart` over `kill`; `kill` can corrupt an unsaved world.
-- `restore_backup` overwrites current files — confirm the target backup UUID
-  with the user and take a fresh backup first when feasible.
+- No backups are available on this panel — never rely on a restore to undo a
+  mistake. Save a copy of any file before overwriting or deleting it.
 - Read a file before overwriting it; never blind-write configs.

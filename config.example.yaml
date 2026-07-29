@@ -651,7 +651,7 @@ tool_groups:
   - name: browser
   # Pterodactyl panel integration (Minecraft server maintenance).
   # Shared connection settings for every pterodactyl_* tool. Mutating tools
-  # (power/file/backup/startup) are hard-gated by human confirmation; enable
+  # (power/file/startup) are hard-gated by human confirmation; enable
   # the guard middleware in extensions_config.json (see below).
   # - name: pterodactyl
   #   panel_url: $PTERODACTYL_PANEL_URL   # e.g. https://panel.example.com
@@ -1021,9 +1021,21 @@ tools:
   # - name: pterodactyl_read_file
   #   group: pterodactyl
   #   use: deerflow.community.pterodactyl.tools:read_file_tool
-  # - name: pterodactyl_list_backups
+  # - name: pterodactyl_read_file_lines   # partial read by line range (paginate big files)
   #   group: pterodactyl
-  #   use: deerflow.community.pterodactyl.tools:list_backups_tool
+  #   use: deerflow.community.pterodactyl.tools:read_file_lines_tool
+  # - name: pterodactyl_search_file       # keyword/regex search, returns only matches
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:search_file_tool
+  # - name: pterodactyl_read_console      # last N console lines via the Wings websocket
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:read_console_tool
+  # - name: pterodactyl_download_file     # stream a file to the workspace (no inline content)
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:download_file_tool
+  # - name: pterodactyl_query_sqlite      # read-only SELECT against a downloaded .db/.sqlite
+  #   group: pterodactyl
+  #   use: deerflow.community.pterodactyl.tools:query_sqlite_tool
   # - name: pterodactyl_get_startup
   #   group: pterodactyl
   #   use: deerflow.community.pterodactyl.tools:get_startup_tool
@@ -1045,15 +1057,6 @@ tools:
   # - name: pterodactyl_delete_file
   #   group: pterodactyl
   #   use: deerflow.community.pterodactyl.tools:delete_file_tool
-  # - name: pterodactyl_create_backup
-  #   group: pterodactyl
-  #   use: deerflow.community.pterodactyl.tools:create_backup_tool
-  # - name: pterodactyl_restore_backup
-  #   group: pterodactyl
-  #   use: deerflow.community.pterodactyl.tools:restore_backup_tool
-  # - name: pterodactyl_delete_backup
-  #   group: pterodactyl
-  #   use: deerflow.community.pterodactyl.tools:delete_backup_tool
   # - name: pterodactyl_update_startup_variable
   #   group: pterodactyl
   #   use: deerflow.community.pterodactyl.tools:update_startup_variable_tool

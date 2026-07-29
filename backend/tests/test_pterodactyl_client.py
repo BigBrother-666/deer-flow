@@ -117,3 +117,50 @@ async def test_timeout_raises_after_retries(monkeypatch):
 
 async def _no_sleep(_seconds):
     return None
+
+
+@pytest.mark.anyio
+async def test_download_streams_signed_url(monkeypatch):
+    import io
+
+    calls = {"n": 0}
+
+    class _StreamCtx:
+        def __init__(self, status, chunks):
+            self.status_code = status
+            self._chunks = chunks
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aiter_bytes(self):
+            for c in self._chunks:
+                yield c
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            # First call: the /download endpoint returns the signed URL.
+            return httpx.Response(200, json={"attributes": {"url": "https://wings/dl?token=x"}})
+
+        def stream(self, method, url, **kwargs):
+            calls["url"] = url
+            return _StreamCtx(200, [b"ab", b"cd"])
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    sink = io.BytesIO()
+    written = await _client().download("/servers/s/files/download", sink, params={"file": "/x.db"})
+    assert written == 4
+    assert sink.getvalue() == b"abcd"
+    assert calls["url"] == "https://wings/dl?token=x"

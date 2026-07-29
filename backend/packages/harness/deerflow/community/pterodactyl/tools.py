@@ -1,19 +1,30 @@
 """Pterodactyl Client API tools.
 
-Read-only tools execute directly. Mutating tools (power/file/backup/startup) are
+Read-only tools execute directly. Mutating tools (power/command/file/startup) are
 listed in ``mutations.py`` and hard-gated by ``PterodactylGuardMiddleware`` — the
 model must obtain an explicit human confirmation before they run.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
+import sqlite3
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from langchain.tools import tool
 
 from .client import PterodactylClient
+from .config import load_config
+from .console import fetch_recent_console, run_command_capture
 from .errors import PterodactylError
+
+# Read-only query verbs allowed against downloaded SQLite databases.
+_SQLITE_READONLY_PREFIXES = ("select", "pragma", "explain", "with")
+_SQLITE_MAX_ROWS = 200
 
 
 def _err(exc: PterodactylError) -> str:
@@ -149,30 +160,6 @@ async def read_file_tool(server_id: str, file_path: str, max_chars: int = 20000)
     return text
 
 
-@tool("pterodactyl_list_backups", parse_docstring=True)
-async def list_backups_tool(server_id: str) -> str:
-    """List backups for a server.
-
-    Args:
-        server_id: The server identifier.
-    """
-    try:
-        data = await _get(f"/servers/{server_id}/backups")
-    except PterodactylError as exc:
-        return _err(exc)
-    backups = [
-        {
-            "uuid": item["attributes"]["uuid"],
-            "name": item["attributes"]["name"],
-            "is_successful": item["attributes"].get("is_successful"),
-            "bytes": item["attributes"].get("bytes"),
-            "created_at": item["attributes"].get("created_at"),
-        }
-        for item in (data or {}).get("data", [])
-    ]
-    return _dump(backups)
-
-
 @tool("pterodactyl_get_startup", parse_docstring=True)
 async def get_startup_tool(server_id: str) -> str:
     """Read the server's startup command and configurable startup variables.
@@ -195,6 +182,100 @@ async def get_startup_tool(server_id: str) -> str:
     ]
     meta = (data or {}).get("meta", {})
     return _dump({"startup_command": meta.get("startup_command"), "variables": variables})
+
+
+@tool("pterodactyl_read_console", parse_docstring=True)
+async def read_console_tool(server_id: str, lines: int = 100) -> str:
+    """Read the most recent console/log output lines from a running server.
+
+    Connects to the panel's live console (websocket), replays the buffered
+    history, and returns the last ``lines`` output lines. Useful for diagnosing
+    crashes, errors, and startup issues without reading log files directly.
+
+    Args:
+        server_id: The server identifier.
+        lines: How many of the most recent console lines to return (default: 100).
+    """
+    origin = load_config().panel_url.rstrip("/")
+    try:
+        collected = await fetch_recent_console(server_id, lines, origin=origin)
+    except PterodactylError as exc:
+        return _err(exc)
+    except Exception as exc:  # noqa: BLE001 - websocket failures are recoverable
+        return f"Error: could not read console for server {server_id}: {exc}"
+    if not collected:
+        return "(no console output received; the server may be offline)"
+    return "\n".join(collected)
+
+
+@tool("pterodactyl_read_file_lines", parse_docstring=True)
+async def read_file_lines_tool(server_id: str, file_path: str, offset: int = 0, limit: int = 200) -> str:
+    """Read a slice of a text file by line range (paginate large files).
+
+    Fetches the file server-side but returns only lines ``offset`` .. ``offset+limit``
+    so a large log/config never floods the context. Line numbers are 0-based.
+
+    Args:
+        server_id: The server identifier.
+        file_path: Absolute path to the file within the server volume.
+        offset: 0-based line index to start from (default: 0).
+        limit: Maximum number of lines to return (default: 200).
+    """
+    try:
+        content = await _get(
+            f"/servers/{server_id}/files/contents",
+            params={"file": file_path},
+            expect_json=False,
+        )
+    except PterodactylError as exc:
+        return _err(exc)
+    text = content if isinstance(content, str) else _dump(content)
+    all_lines = text.splitlines()
+    total = len(all_lines)
+    if offset < 0:
+        offset = 0
+    window = all_lines[offset : offset + max(limit, 0)]
+    header = f"[lines {offset}-{offset + len(window)} of {total}]"
+    return header + "\n" + "\n".join(window)
+
+
+@tool("pterodactyl_search_file", parse_docstring=True)
+async def search_file_tool(server_id: str, file_path: str, pattern: str, max_matches: int = 50, ignore_case: bool = True) -> str:
+    """Search a text file for a keyword/regex and return only matching lines.
+
+    Streams the file server-side and returns matching lines with 1-based line
+    numbers — the full file is never dumped into the context. Use this to locate
+    errors/keywords in large logs before reading a specific range.
+
+    Args:
+        server_id: The server identifier.
+        file_path: Absolute path to the file within the server volume.
+        pattern: Substring or regular expression to search for.
+        max_matches: Maximum number of matching lines to return (default: 50).
+        ignore_case: Case-insensitive matching (default: True).
+    """
+    try:
+        content = await _get(
+            f"/servers/{server_id}/files/contents",
+            params={"file": file_path},
+            expect_json=False,
+        )
+    except PterodactylError as exc:
+        return _err(exc)
+    text = content if isinstance(content, str) else _dump(content)
+    try:
+        regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+    except re.error as exc:
+        return f"Error: invalid search pattern: {exc}"
+    matches = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if regex.search(line):
+            matches.append(f"{lineno}: {line}")
+            if len(matches) >= max(max_matches, 1):
+                break
+    if not matches:
+        return f"(no matches for {pattern!r} in {file_path})"
+    return "\n".join(matches)
 
 
 # ---------------------------------------------------------------------------
@@ -223,18 +304,38 @@ async def power_action_tool(server_id: str, signal: str) -> str:
 
 
 @tool("pterodactyl_send_command", parse_docstring=True)
-async def send_command_tool(server_id: str, command: str) -> str:
-    """Send a console command to a running server. REQUIRES HUMAN CONFIRMATION.
+async def send_command_tool(server_id: str, command: str, capture_output: bool = True, wait_seconds: float = 5.0) -> str:
+    """Send a console command to a running server and capture its output. REQUIRES HUMAN CONFIRMATION.
+
+    When ``capture_output`` is True (default) this opens the live console
+    websocket, sends the command, captures the output it prints (bounded by a
+    short idle/overall timeout), then closes the socket and returns that output —
+    a single atomic connect → send → read → close. Set it to False for
+    fire-and-forget (POST the command over REST without waiting for output).
 
     Args:
         server_id: The server identifier.
-        command: The console command to execute (e.g. "say hello", "op steve").
+        command: The console command to execute (e.g. "list", "say hello", "op steve").
+        capture_output: Capture and return the command's console output (default: True).
+        wait_seconds: Max seconds to wait for output before returning (default: 5.0).
     """
+    if not capture_output:
+        try:
+            await _send("POST", f"/servers/{server_id}/command", json={"command": command})
+        except PterodactylError as exc:
+            return _err(exc)
+        return f"OK: command sent to server {server_id}: {command}"
+
+    origin = load_config().panel_url.rstrip("/")
     try:
-        await _send("POST", f"/servers/{server_id}/command", json={"command": command})
+        lines = await run_command_capture(server_id, command, origin=origin, overall_timeout=wait_seconds)
     except PterodactylError as exc:
         return _err(exc)
-    return f"OK: command sent to server {server_id}: {command}"
+    except Exception as exc:  # noqa: BLE001 - websocket failures are recoverable
+        return f"Error: could not capture output for '{command}' on {server_id}: {exc}"
+    if not lines:
+        return f"OK: command sent to server {server_id}: {command}\n(no output captured within {wait_seconds:.0f}s)"
+    return "\n".join(lines)
 
 
 @tool("pterodactyl_write_file", parse_docstring=True)
@@ -294,57 +395,6 @@ async def delete_file_tool(server_id: str, file_path: str, root: str = "/") -> s
     return f"OK: deleted {file_path} on server {server_id}."
 
 
-@tool("pterodactyl_create_backup", parse_docstring=True)
-async def create_backup_tool(server_id: str, name: str | None = None) -> str:
-    """Create a new backup of the server. REQUIRES HUMAN CONFIRMATION.
-
-    Args:
-        server_id: The server identifier.
-        name: Optional backup name.
-    """
-    payload: dict[str, Any] = {}
-    if name:
-        payload["name"] = name
-    try:
-        data = await _send("POST", f"/servers/{server_id}/backups", json=payload)
-    except PterodactylError as exc:
-        return _err(exc)
-    uuid = (data or {}).get("attributes", {}).get("uuid")
-    return f"OK: backup created for server {server_id} (uuid={uuid})."
-
-
-@tool("pterodactyl_restore_backup", parse_docstring=True)
-async def restore_backup_tool(server_id: str, backup_uuid: str) -> str:
-    """Restore a server from a backup. REQUIRES HUMAN CONFIRMATION.
-
-    This overwrites current server files with the backup's contents.
-
-    Args:
-        server_id: The server identifier.
-        backup_uuid: UUID of the backup to restore (from pterodactyl_list_backups).
-    """
-    try:
-        await _send("POST", f"/servers/{server_id}/backups/{backup_uuid}/restore", json={})
-    except PterodactylError as exc:
-        return _err(exc)
-    return f"OK: restore started for server {server_id} from backup {backup_uuid}."
-
-
-@tool("pterodactyl_delete_backup", parse_docstring=True)
-async def delete_backup_tool(server_id: str, backup_uuid: str) -> str:
-    """Delete a backup. REQUIRES HUMAN CONFIRMATION.
-
-    Args:
-        server_id: The server identifier.
-        backup_uuid: UUID of the backup to delete.
-    """
-    try:
-        await _send("DELETE", f"/servers/{server_id}/backups/{backup_uuid}")
-    except PterodactylError as exc:
-        return _err(exc)
-    return f"OK: deleted backup {backup_uuid} on server {server_id}."
-
-
 @tool("pterodactyl_update_startup_variable", parse_docstring=True)
 async def update_startup_variable_tool(server_id: str, env_variable: str, value: str) -> str:
     """Update an editable startup (environment) variable. REQUIRES HUMAN CONFIRMATION.
@@ -361,3 +411,125 @@ async def update_startup_variable_tool(server_id: str, env_variable: str, value:
         return _err(exc)
     current = (data or {}).get("attributes", {}).get("server_value", value)
     return f"OK: set {env_variable}={current} on server {server_id}."
+
+
+# ---------------------------------------------------------------------------
+# Read-only download / SQLite tools — these never inline full file contents.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_workspace_dir(runtime: Any) -> Path:
+    """Resolve the current thread's sandbox workspace host dir for downloads."""
+    from deerflow.config.paths import get_paths
+    from deerflow.runtime.user_context import get_effective_user_id, resolve_runtime_user_id
+
+    thread_id = None
+    if runtime is not None:
+        ctx = getattr(runtime, "context", None) or {}
+        thread_id = ctx.get("thread_id")
+        if not thread_id:
+            cfg = getattr(runtime, "config", None) or {}
+            thread_id = (cfg.get("configurable") or {}).get("thread_id")
+    if not thread_id:
+        raise PterodactylError("No active thread; cannot resolve a download directory.")
+    user_id = (resolve_runtime_user_id(runtime) if runtime is not None else None) or get_effective_user_id()
+    workspace = get_paths().sandbox_workspace_dir(thread_id, user_id=user_id)
+    workspace.mkdir(parents=True, exist_ok=True)
+    return workspace
+
+
+@tool("pterodactyl_download_file", parse_docstring=True)
+async def download_file_tool(server_id: str, file_path: str, runtime: Any = None) -> str:
+    """Download a server file into the workspace WITHOUT reading it into context.
+
+    Streams the file (including binary/DB files) to
+    ``/mnt/user-data/workspace/`` and returns its local path, size, and sha256.
+    Use this for databases and large files: download here, then inspect with
+    ``pterodactyl_query_sqlite`` or the sandbox's own file/search tools instead
+    of loading the whole file into the model context.
+
+    Args:
+        server_id: The server identifier.
+        file_path: Absolute path to the file within the server volume.
+    """
+    from hashlib import sha256
+
+    try:
+        workspace = _resolve_workspace_dir(runtime)
+    except PterodactylError as exc:
+        return _err(exc)
+    dest = workspace / Path(file_path).name
+    hasher = sha256()
+
+    class _Sink:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def write(self, chunk: bytes) -> None:
+            hasher.update(chunk)
+            self._fh.write(chunk)
+
+    try:
+        with dest.open("wb") as fh:
+            written = await PterodactylClient().download(
+                f"/servers/{server_id}/files/download",
+                _Sink(fh),
+                params={"file": file_path},
+            )
+    except PterodactylError as exc:
+        return _err(exc)
+    virtual = f"/mnt/user-data/workspace/{dest.name}"
+    return _dump({"path": virtual, "bytes": written, "sha256": hasher.hexdigest()})
+
+
+def _run_sqlite_query(db_path: str, query: str, params: list[Any] | None) -> dict[str, Any]:
+    """Execute a read-only query against a local SQLite file (blocking)."""
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(query, params or [])
+        rows = cur.fetchmany(_SQLITE_MAX_ROWS + 1)
+        columns = [d[0] for d in cur.description] if cur.description else []
+        truncated = len(rows) > _SQLITE_MAX_ROWS
+        data = [dict(row) for row in rows[:_SQLITE_MAX_ROWS]]
+        return {"columns": columns, "rows": data, "truncated": truncated}
+    finally:
+        conn.close()
+
+
+@tool("pterodactyl_query_sqlite", parse_docstring=True)
+async def query_sqlite_tool(server_id: str, file_path: str, query: str) -> str:
+    """Run a read-only SQL query against a SQLite database file on the server.
+
+    Downloads the ``.db``/``.sqlite`` file to a temporary location and executes a
+    single read-only query (SELECT/PRAGMA/EXPLAIN/WITH) against it, returning up
+    to 200 rows as JSON. The database itself never enters the context. Writes
+    are rejected and the DB is opened read-only.
+
+    Args:
+        server_id: The server identifier.
+        file_path: Absolute path to the SQLite database within the server volume.
+        query: A single read-only SQL statement (SELECT/PRAGMA/EXPLAIN/WITH).
+    """
+    stripped = query.strip().rstrip(";").strip()
+    if ";" in stripped:
+        return "Error: only a single SQL statement is allowed."
+    if not stripped.lower().startswith(_SQLITE_READONLY_PREFIXES):
+        return "Error: only read-only queries (SELECT/PRAGMA/EXPLAIN/WITH) are allowed."
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
+        try:
+            await PterodactylClient().download(
+                f"/servers/{server_id}/files/download",
+                tmp,
+                params={"file": file_path},
+            )
+            tmp.flush()
+        except PterodactylError as exc:
+            return _err(exc)
+        try:
+            result = await asyncio.to_thread(_run_sqlite_query, tmp.name, stripped, None)
+        except sqlite3.Error as exc:
+            return f"Error: SQLite query failed: {exc}"
+    return _dump(result)

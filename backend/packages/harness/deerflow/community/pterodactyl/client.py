@@ -95,6 +95,34 @@ class PterodactylClient:
         # Exhausted retries on retryable status codes.
         raise PterodactylTimeoutError(f"Request to {path} failed after retries: {last_exc}")
 
+    async def download(self, path: str, dest, *, params: dict[str, Any] | None = None) -> int:
+        """Stream a Client API download to ``dest`` (a binary file object).
+
+        Two-step Pterodactyl flow: ``path`` (e.g. ``/servers/{id}/files/download``)
+        returns a signed one-time URL, which is then fetched without auth headers.
+        Bytes are streamed to disk so large/binary files never enter memory whole.
+        Returns the number of bytes written.
+        """
+        meta = await self.request("GET", path, params=params)
+        url = ((meta or {}).get("attributes") or {}).get("url")
+        if not url:
+            raise PterodactylAPIError(f"Panel did not return a download URL for {path}")
+
+        written = 0
+        try:
+            async with httpx.AsyncClient(timeout=self._config.timeout) as client:
+                async with client.stream("GET", url) as response:
+                    if response.status_code >= 400:
+                        raise PterodactylAPIError(f"Download failed with {response.status_code}", status_code=response.status_code)
+                    async for chunk in response.aiter_bytes():
+                        dest.write(chunk)
+                        written += len(chunk)
+        except httpx.TimeoutException as exc:
+            raise PterodactylTimeoutError(f"Download of {path} timed out") from exc
+        except httpx.HTTPError as exc:
+            raise PterodactylAPIError(f"HTTP error downloading {path}: {exc}") from exc
+        return written
+
     def _handle_response(self, response: httpx.Response, *, expect_json: bool) -> Any:
         status = response.status_code
         if status == 401 or status == 403:
