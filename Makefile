@@ -1,9 +1,23 @@
 # DeerFlow - Unified Development Environment
 
-.PHONY: help config config-upgrade check install setup doctor support-bundle detect-thread-boundaries detect-blocking-io dev dev-daemon start start-daemon nginx stop up down clean docker-init docker-start docker-stop docker-logs docker-logs-frontend docker-logs-gateway docker-logs-redis
+.PHONY: help config config-upgrade check install setup doctor support-bundle detect-thread-boundaries detect-blocking-io dev dev-daemon start start-daemon nginx stop up down clean docker-init docker-start docker-stop docker-restart docker-logs docker-logs-frontend docker-logs-gateway docker-logs-redis rag-stack-up rag-stack-up-dev rag-stack-down rag-stack-logs rag-ingest-docker pg-up pg-down pg-restart pg-destroy pg-logs stack-up stack-up-dev stack-down stack-restart rag-ingest rag-serve rag-stats rag-reset
 
 BASH ?= bash
 BACKEND_UV_RUN = cd backend && uv run
+
+# Standalone pgvector Postgres (docker compose) + plugin-docs RAG vector store.
+DOCKER_COMPOSE ?= docker compose
+RAG_COMPOSE_FILE = docker/docker-compose.rag.yaml
+# Dev overlay: layer on top of RAG_COMPOSE_FILE to hot-reload rag-mcp (build the
+# `dev` stage + bind-mount source). Prod (rag-stack-up) omits it and builds the
+# `runtime` stage with code baked in — mirroring DeerFlow's own dev/prod split.
+RAG_DEV_COMPOSE_FILE = docker/docker-compose.rag.dev.yaml
+RAG_DIR = backend/packages/pterodactyl-rag
+# Root .env holds the RAG secrets/paths (PTERO_RAG_*). Unlike docker compose,
+# neither make nor `uv run` auto-loads it, so the rag-* targets source it
+# themselves at runtime. Values stay in the gitignored .env; nothing is inlined.
+ENV_FILE ?= .env
+LOAD_DOTENV = set -a; [ -f $(ENV_FILE) ] && . ./$(ENV_FILE); set +a;
 
 # Detect OS for Windows compatibility
 ifeq ($(OS),Windows_NT)
@@ -44,10 +58,37 @@ help:
 	@echo "  make docker-init     - Pull the sandbox image"
 	@echo "  make docker-start    - Start Docker services (mode-aware from config.yaml, localhost:2026)"
 	@echo "  make docker-stop     - Stop Docker development services"
+	@echo "  make docker-restart  - Restart Docker development services"
 	@echo "  make docker-logs     - View Docker development logs"
 	@echo "  make docker-logs-frontend - View Docker frontend logs"
 	@echo "  make docker-logs-gateway - View Docker gateway logs"
 	@echo "  make docker-logs-redis - View Docker Redis logs"
+	@echo ""
+	@echo "RAG Extension Stack (pgvector + rag-mcp) Commands:"
+	@echo "  make rag-stack-up      - Build + start the RAG stack, prod mode (code baked in); creates shared network"
+	@echo "  make rag-stack-up-dev  - Build + start the RAG stack, dev mode (source bind-mounted, watchfiles hot-reload)"
+	@echo "  make rag-stack-down    - Stop and remove the RAG stack"
+	@echo "  make rag-stack-logs    - Tail RAG stack logs (postgres + rag-mcp)"
+	@echo "  make rag-ingest-docker - One-shot docs ingest inside the stack (mounts PTERO_RAG_DOCS_DIR)"
+	@echo ""
+	@echo "Postgres (pgvector) Commands:"
+	@echo "  make pg-up           - Start only the pgvector Postgres service of the RAG stack"
+	@echo "  make pg-down         - Stop and remove the RAG stack containers"
+	@echo "  make pg-restart      - Restart the Postgres service"
+	@echo "  make pg-destroy      - Stop the stack and DELETE its data volume (destructive)"
+	@echo "  make pg-logs         - Tail Postgres logs"
+	@echo ""
+	@echo "Full Stack (Docker dev services + RAG extension stack) Commands:"
+	@echo "  make stack-up        - Start the RAG stack (prod), then the Docker dev stack (localhost:2026)"
+	@echo "  make stack-up-dev    - Start the RAG stack (dev hot-reload), then the Docker dev stack"
+	@echo "  make stack-down      - Stop the Docker dev stack, then the RAG stack"
+	@echo "  make stack-restart   - Restart the RAG stack and the Docker dev stack"
+	@echo ""
+	@echo "Plugin-Docs RAG (host process, local debug) Commands:"
+	@echo "  make rag-ingest      - Ingest PTERO_RAG_DOCS_DIR into the vector store (needs embed key)"
+	@echo "  make rag-serve       - Run the RAG MCP server in the foreground"
+	@echo "  make rag-stats       - Print vector-store index health"
+	@echo "  make rag-reset       - Drop the RAG schema (destructive; asks for env RAG_RESET_YES=1)"
 
 ## Setup & Diagnosis
 setup:
@@ -149,6 +190,10 @@ docker-start:
 docker-stop:
 	@$(RUN_WITH_GIT_BASH) ./scripts/docker.sh stop
 
+# Restart Docker development environment
+docker-restart:
+	@$(RUN_WITH_GIT_BASH) ./scripts/docker.sh restart
+
 # View Docker development logs
 docker-logs:
 	@$(RUN_WITH_GIT_BASH) ./scripts/docker.sh logs
@@ -172,3 +217,111 @@ up:
 # Stop and remove production containers
 down:
 	@$(RUN_WITH_GIT_BASH) ./scripts/deploy.sh down
+
+# ==========================================
+# RAG Extension Stack (pgvector + rag-mcp) Commands
+# ==========================================
+# The RAG extension stack (docker/docker-compose.rag.yaml) bundles two services:
+#   - postgres:  pgvector (backs DeerFlow persistence + the RAG vector store)
+#   - rag-mcp:   the containerized pterodactyl-rag MCP server (http :8000)
+# on the shared external network `deer-flow-shared`, which the main dev stack
+# also joins so the gateway reaches the server at http://rag-mcp:8000/mcp.
+
+# Start the whole RAG extension stack, PROD mode (rag-mcp code baked into the
+# image, no watcher; builds the `runtime` stage; creates the shared network)
+rag-stack-up:
+	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) up -d --build
+	@echo "✓ RAG stack up (prod): deer-flow-postgres + deer-flow-rag-mcp (http://rag-mcp:8000/mcp)"
+
+# Start the RAG extension stack, DEV mode (rag-mcp source bind-mounted, watchfiles
+# hot-reload; builds the `dev` stage via the dev overlay compose)
+rag-stack-up-dev:
+	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) -f $(RAG_DEV_COMPOSE_FILE) up -d --build
+	@echo "✓ RAG stack up (dev, hot-reload): deer-flow-postgres + deer-flow-rag-mcp (http://rag-mcp:8000/mcp)"
+
+# Stop and remove the RAG extension stack (keeps the data volume)
+rag-stack-down:
+	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) down
+
+# Tail RAG extension stack logs (postgres + rag-mcp)
+rag-stack-logs:
+	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) logs -f
+
+# One-shot docs ingest inside the stack (mounts PTERO_RAG_DOCS_DIR at /docs).
+# Reuses the rag-mcp image + in-network DSN; embeds via host Ollama.
+rag-ingest-docker:
+	@$(LOAD_DOTENV) test -n "$$PTERO_RAG_DOCS_DIR" || { echo "PTERO_RAG_DOCS_DIR is required (set it in .env)"; exit 1; }
+	@$(LOAD_DOTENV) $(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) run --rm \
+		-v "$$PTERO_RAG_DOCS_DIR:/docs:ro" -e PTERO_RAG_DOCS_DIR=/docs \
+		rag-mcp uv run --no-sync pterodactyl-rag ingest
+
+# --- Postgres-only helpers (single service of the RAG stack) ---
+
+# Start only the pgvector Postgres service
+pg-up:
+	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) up -d postgres
+	@echo "✓ Postgres up on $(PTERO_RAG_DATABASE_URL)"
+
+# Stop and remove the RAG stack containers
+pg-down:
+	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) down
+
+# Restart only the Postgres service (keeps the data volume)
+pg-restart:
+	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) restart postgres
+
+# Stop the stack AND delete the data volume (destructive; wipes all data)
+pg-destroy:
+	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) down -v
+
+# Tail Postgres logs
+pg-logs:
+	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) logs -f postgres
+
+# ==========================================
+# Full Stack (dev services + RAG extension stack) Commands
+# ==========================================
+
+# Start the RAG extension stack first (creates deer-flow-shared), then the dev stack.
+# RAG runs in prod mode (code baked in); use stack-up-dev for RAG hot-reload.
+stack-up: rag-stack-up docker-start
+
+# Full dev stack with RAG hot-reload: RAG dev overlay first, then the dev stack.
+stack-up-dev: rag-stack-up-dev docker-start
+
+# Stop the Docker dev stack first, then the RAG extension stack
+stack-down: docker-stop rag-stack-down
+
+# Restart the RAG extension stack and the Docker dev stack
+stack-restart: rag-stack-up docker-restart
+
+# ==========================================
+# Plugin-Docs RAG Vector Store Commands
+# ==========================================
+# These wrap `pterodactyl-rag` (standalone uv project). They read secrets/paths
+# from your environment — set them before running, never inline them here:
+#   export PTERO_RAG_EMBED_API_KEY="$$OPENAI_API_KEY"   # or "local" for Ollama/TEI
+#   export PTERO_RAG_DOCS_DIR="/abs/path/to/docs"       # required by rag-ingest
+# PTERO_RAG_DATABASE_URL defaults to the docker-compose.rag.yaml DSN.
+
+# Ingest docs (chunk -> embed -> upsert) and prune deleted files
+rag-ingest:
+	@$(LOAD_DOTENV) cd $(RAG_DIR) && uv run pterodactyl-rag ingest
+
+# Run the RAG MCP server in the foreground (stdio, or http via PTERO_RAG_TRANSPORT)
+rag-serve:
+	@$(LOAD_DOTENV) cd $(RAG_DIR) && uv run pterodactyl-rag serve
+
+# Print index health (documents / chunks / embed model / dim / last ingest)
+rag-stats:
+	@$(LOAD_DOTENV) cd $(RAG_DIR) && uv run pterodactyl-rag stats
+
+# Drop the RAG schema (destructive). Guarded: set RAG_RESET_YES=1 to proceed.
+rag-reset:
+ifeq ($(RAG_RESET_YES),1)
+	@$(LOAD_DOTENV) cd $(RAG_DIR) && uv run pterodactyl-rag reset --yes
+else
+	@echo "Refusing to reset: this drops the pterodactyl_rag schema."
+	@echo "Re-run with: RAG_RESET_YES=1 make rag-reset"
+	@exit 1
+endif

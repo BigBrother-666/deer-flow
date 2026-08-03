@@ -1,0 +1,37 @@
+# RAG extension stack — DEV overlay (hot-reload).
+#
+# Layered ON TOP of docker-compose.rag.yaml to turn the rag-mcp service into a
+# hot-reloading dev container, mirroring DeerFlow's own dev convention
+# (docker-compose-dev.yaml vs the prod docker-compose.yaml):
+#
+#   prod (make rag-stack-up):     rag-mcp built at the `runtime` stage, code
+#                                 COPIED into the image, no watcher.
+#   dev  (make rag-stack-up-dev): rag-mcp built at the `dev` stage, source
+#                                 BIND-MOUNTED, `watchfiles` restarts the server
+#                                 on any edit under src/.
+#
+# Usage (via root Makefile):
+#   make rag-stack-up-dev     # build + start with hot-reload
+# Or directly:
+#   docker compose -f docker/docker-compose.rag.yaml \
+#                  -f docker/docker-compose.rag.dev.yaml up -d --build
+#
+# postgres is inherited unchanged from the base file; only rag-mcp is overridden.
+
+services:
+  rag-mcp:
+    build:
+      # Build the dev stage (retains the dev group incl. watchfiles).
+      target: dev
+    volumes:
+      # Bind-mount the package source so edits on the host trigger a watchfiles
+      # restart inside the container. The named .venv volume shadows the host so
+      # the container keeps the .venv built into the dev image (the host has no
+      # .venv, and mounting over it would hide the interpreter's packages).
+      - ../backend/packages/pterodactyl-rag/src:/app/src
+      - ../backend/packages/pterodactyl-rag/pyproject.toml:/app/pyproject.toml
+      - ../backend/packages/pterodactyl-rag/uv.lock:/app/uv.lock
+      - rag-mcp-venv:/app/.venv
+
+volumes:
+  rag-mcp-venv:

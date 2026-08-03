@@ -1929,6 +1929,18 @@ database:
   # full: current full-message checkpoints; delta: DeltaChannel for messages.
   checkpoint_channel_mode: full
 
+# ----------------------------------------------------------------------------
+# Optional: plugin-docs RAG MCP server (backend/packages/pterodactyl-rag)
+# ----------------------------------------------------------------------------
+# The standalone `pterodactyl-rag` MCP server indexes Minecraft/Pterodactyl
+# plugin documentation into an isolated `pterodactyl_rag` schema of THIS same
+# Postgres database (requires database.backend: postgres). It is configured via
+# PTERO_RAG_* env vars in extensions_config.json (see the disabled
+# `pterodactyl_rag` block in extensions_config.example.json), NOT here — reuse
+# $DATABASE_URL for PTERO_RAG_DATABASE_URL and $OPENAI_API_KEY for
+# PTERO_RAG_EMBED_API_KEY. Run `pterodactyl-rag ingest` with PTERO_RAG_DOCS_DIR
+# set before enabling. Detail: backend/packages/pterodactyl-rag/README.md.
+
 # ============================================================================
 # Run Events Configuration
 # ============================================================================

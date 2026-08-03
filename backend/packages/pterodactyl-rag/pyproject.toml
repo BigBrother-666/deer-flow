@@ -1,0 +1,64 @@
+[project]
+name = "deerflow-pterodactyl-rag"
+version = "0.1.0"
+description = "RAG retrieval server over Pterodactyl/Minecraft plugin documentation, exposed via MCP"
+readme = "README.md"
+requires-python = ">=3.12"
+# Standalone package (NOT a deerflow-harness workspace member): its embedding /
+# vector / document-parsing dependencies deliberately stay out of the Gateway
+# process. DeerFlow only ever talks to it over the MCP wire, so there is no code
+# import between this package and deerflow-harness.
+dependencies = [
+    # Pin to the 1.x line: mcp 2.0.0 (2026-07-28) is a breaking SDK rewrite that
+    # drops `mcp.server.fastmcp.FastMCP`, which server.py imports. Revisit when
+    # migrating to the 2.x server API.
+    "mcp>=1.2.0,<2",
+    "psycopg[binary,pool]>=3.3.3",
+    "pgvector>=0.3.6",
+    "httpx>=0.28.0",
+    "tiktoken>=0.8.0",
+    "pypdf>=5.1.0",
+    "beautifulsoup4>=4.12.0",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+pterodactyl-rag = "pterodactyl_rag.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.14.11",
+    # Dev-only hot-reload watcher. FastMCP's `mcp.run(transport="streamable-http")`
+    # owns its event loop and exposes no uvicorn `--reload`, so the dev container
+    # wraps `pterodactyl-rag serve` in `watchfiles` (the same file-watcher uvicorn
+    # --reload uses) to restart the process on source edits. Not shipped in the
+    # prod image, which uses `uv sync --frozen --no-dev`.
+    "watchfiles>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pterodactyl_rag"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 240
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pterodactyl_rag"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

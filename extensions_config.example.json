@@ -55,6 +55,28 @@
           }
         }
       }
+    },
+    "pterodactyl_rag": {
+      "enabled": false,
+      "type": "http",
+      "url": "http://rag-mcp:8000/mcp",
+      "headers": {},
+      "tool_call_timeout": 60,
+      "description": "Retrieval over Pterodactyl/Minecraft plugin documentation (backend/packages/pterodactyl-rag). Recommended: run the containerized RAG extension stack (`make rag-stack-up`) — pgvector + rag-mcp on the shared docker network `deer-flow-shared` — and the gateway reaches it by service name at rag-mcp:8000. Ingest docs first with `make rag-ingest-docker`. Alternative (host process, no docker): set type=stdio, command=pterodactyl-rag, args=[serve], env PTERO_RAG_DATABASE_URL=$DATABASE_URL and PTERO_RAG_EMBED_API_KEY=$OPENAI_API_KEY, and run `pterodactyl-rag ingest` with PTERO_RAG_DOCS_DIR set before enabling.",
+      "routing": {
+        "mode": "prefer",
+        "priority": 60,
+        "keywords": [
+          "plugin",
+          "插件",
+          "config",
+          "permission",
+          "EssentialsX",
+          "documentation",
+          "how to configure",
+          "command node"
+        ]
+      }
     }
   },
   "skills": {}

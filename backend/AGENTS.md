@@ -29,6 +29,7 @@ deer-flow/
 │   ├── Makefile               # Backend-only commands (dev, gateway, lint)
 │   ├── langgraph.json         # LangGraph Studio graph configuration
 │   ├── packages/
+│   │   ├── pterodactyl-rag/   # Standalone plugin-docs RAG MCP server (deerflow-pterodactyl-rag; NOT a uv workspace member — see its README.md)
 │   │   └── harness/           # deerflow-harness package (import: deerflow.*)
 │   │       ├── pyproject.toml
 │   │       └── deerflow/
@@ -682,6 +683,17 @@ E2B output sync records remote file versions and actual host file metadata in a 
 - **Stdio file outputs**: Persistent stdio sessions are scoped by `user_id:thread_id`. For stdio transports only, DeerFlow pins the subprocess default `cwd` to the thread workspace and `TMPDIR`/`TMP`/`TEMP` to `workspace/.mcp/tmp/`, unless the operator explicitly configured `cwd` or temp env values. SSE/HTTP transports skip this filesystem prep entirely.
 - **Stdio path translation**: MCP-returned local file references are not copied. If a `ResourceLink` or conservative free-text path resolves to an existing file inside the thread's mounted user-data tree, it is translated deterministically to `/mnt/user-data/...`; paths outside that tree remain unchanged.
 - **Runtime updates**: Gateway API saves to extensions_config.json; the Gateway-embedded runtime detects changes via the resolved-path + content-signature check above, so multi-worker / stale-mtime deployments still pick up an added/removed MCP server without a restart (the `PUT /api/mcp/config` reset only clears the cache in its own worker)
+
+### Plugin-Docs RAG MCP Server (`packages/pterodactyl-rag/`)
+
+A **standalone** package (`deerflow-pterodactyl-rag`, import prefix `pterodactyl_rag.*`) that indexes Pterodactyl/Minecraft **plugin documentation** and serves read-only retrieval tools to the agent over MCP. It is deliberately **not** a `deerflow-harness` uv workspace member: it pulls in heavy deps (`psycopg`, `pgvector`, `pypdf`, `beautifulsoup4`) that must stay out of the Gateway process, so DeerFlow spawns it as its own MCP server process. Those harness-incompatible deps are lazy-imported, so the pure logic modules load anywhere. Full detail in [packages/pterodactyl-rag/README.md](packages/pterodactyl-rag/README.md) and design doc `docs/plans/2026-07-29-pterodactyl-rag-mcp-design.md`.
+
+- **Pipeline**: `loaders` (md/txt/html/pdf + YAML frontmatter / `.rag.yaml` sidecar) → `splitter` (token/heading-aware, tiktoken) → `tags` (namespaced `plugin:x`/`category:y`, inferred from path, frontmatter-overridable) → `embeddings` (batched OpenAI-compatible client w/ retry) → `store` (pgvector, isolated `pterodactyl_rag` Postgres schema, HNSW + GIN; in-memory store for tests). `retriever` embeds the query, fuzzy-normalizes the `plugin` hint (difflib), applies a **soft** tag filter (a filter matching nothing is dropped and flagged `relaxed`, never a hard empty failure), and bounds snippets.
+- **Five MCP tools** (`server.py`, FastMCP): `rag_search` (`category`/`lang` are schema **enums**, `plugin`/`tags` are fuzzy-normalized strings; returns hits + a `filter` echo block `{applied, relaxed, note}`), `rag_get_document`, `rag_list_sources`, `rag_list_facets` (the **discovery** tool — real tag values per namespace), `rag_stats`. Every tool catches its own errors and returns a recoverable string payload rather than raising. `rag_search` is unavailable (returns a note) when no embedding key is configured; discovery/stats still work.
+- **Config**: env-only `PTERO_RAG_*` (`Settings.from_env()`); secrets (`PTERO_RAG_DATABASE_URL`, `PTERO_RAG_EMBED_API_KEY`) only via `$VAR` from `extensions_config.json`, never inline, never logged. The embedding dim/model is pinned on the index at first ingest; the server **refuses to start** against an index whose stored dim/model differs.
+- **CLI** (`pterodactyl-rag`): `ingest` (hash-skip unchanged, replace changed, prune deleted), `serve` (stdio, or streamable-http when `PTERO_RAG_TRANSPORT=http`), `stats`, `reset --yes`.
+- **Wiring**: register under `mcpServers` in `extensions_config.json` (disabled example block in `extensions_config.example.json`); no harness code change. `rag_search`/`rag_get_document` are added to the Gateway `ToolResultSanitizationMiddleware` remote-content allowlist because plugin docs are untrusted third-party content. The `minecraft-server-ops` skill encodes the *discover-then-filter* workflow (`rag_list_facets` → `rag_search plugin=`).
+- **Tests**: `packages/pterodactyl-rag/tests/` — deterministic fake embedder + in-memory store, no live DB/API; `test_end_to_end_smoke.py` wires the full disk→ingest→search→cite path against that fixture pair (a live-Postgres/real-embedding smoke stays manual — see the package README). Run: `cd backend && PYTHONPATH=packages/pterodactyl-rag/src uv run python -m pytest packages/pterodactyl-rag/tests/ -q`.
 
 ### Skills System (`packages/harness/deerflow/skills/`)
 

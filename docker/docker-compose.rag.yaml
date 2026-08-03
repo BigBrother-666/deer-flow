@@ -1,0 +1,89 @@
+# DeerFlow RAG extension stack (pgvector + pterodactyl-rag MCP server)
+#
+# A self-contained extension stack, independent of the DeerFlow main stack:
+#   - postgres:  pgvector, backs both the RAG vector store (schema
+#                `pterodactyl_rag`) and, optionally, DeerFlow's own persistence.
+#   - rag-mcp:   the pterodactyl-rag MCP server (streamable-http on :8000).
+#
+# Both services join the shared external network `deer-flow-shared`, which the
+# DeerFlow main stack (docker-compose-dev.yaml) also joins, so the gateway
+# reaches this server by service name at http://rag-mcp:8000/mcp.
+#
+# Embeddings (Ollama) stay on the HOST — rag-mcp reaches them via
+# host.docker.internal:11434 (extra_hosts maps that to the host gateway on Linux).
+#
+# Usage (via root Makefile):
+#   make rag-stack-up      # build + start pgvector + rag-mcp
+#   make rag-stack-down    # stop + remove
+#   make rag-stack-logs    # tail logs
+#   make rag-ingest-docker # one-shot ingest of $PTERO_RAG_DOCS_DIR into the store
+#
+# Or directly:
+#   docker compose -f docker/docker-compose.rag.yaml up -d --build
+#
+# This stack creates the `deer-flow-shared` network. Start it BEFORE the main
+# stack (which joins the network as external), or run `docker network create
+# deer-flow-shared` first.
+#
+# Postgres defaults (override via project-root .env):
+#   postgresql://deerflow:deerflow@localhost:5432/deerflow   (host access)
+#   postgresql://deerflow:deerflow@postgres:5432/deerflow    (in-network, rag-mcp)
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: deer-flow-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-deerflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deerflow}
+      POSTGRES_DB: ${POSTGRES_DB:-deerflow}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - deer-flow-postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-deerflow} -d ${POSTGRES_DB:-deerflow}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - deer-flow-shared
+
+  rag-mcp:
+    build:
+      context: ../backend/packages/pterodactyl-rag
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        UV_INDEX_URL: ${UV_INDEX_URL:-}
+    container_name: deer-flow-rag-mcp
+    # env_file supplies PTERO_RAG_EMBED_* (model, dim, api key, chunking) from the
+    # project-root .env; the explicit `environment:` below overrides the vars
+    # whose HOST value (localhost) is wrong inside the container.
+    env_file:
+      - ../.env
+#    environment:
+#      # In-network DSN: reach postgres by compose service name, not localhost.
+#      - PTERO_RAG_DATABASE_URL=postgresql://${POSTGRES_USER:-deerflow}:${POSTGRES_PASSWORD:-deerflow}@postgres:5432/${POSTGRES_DB:-deerflow}
+#      - PTERO_RAG_TRANSPORT=http
+#      - PTERO_RAG_HTTP_HOST=0.0.0.0
+#      - PTERO_RAG_HTTP_PORT=8000
+#      # Ollama stays on the host; reach it via the host gateway, not localhost.
+#      - PTERO_RAG_EMBED_BASE_URL=http://host.docker.internal:11434/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - deer-flow-shared
+
+networks:
+  deer-flow-shared:
+    name: deer-flow-shared
+    driver: bridge
+
+volumes:
+  deer-flow-postgres-data:

@@ -96,6 +96,34 @@ call needs its own confirmed marker.
   with `pterodactyl_rename_file`, confirmed) so you can restore by hand if the
   change goes wrong. Make the smallest reversible change possible.
 
+## Looking up plugin documentation (rag_* tools)
+
+When a task needs to know **how a specific plugin is configured** — a config
+key, a permission node, a command, or default behavior — do not guess from
+memory. If the `rag_*` tools are available (the `pterodactyl_rag` MCP server is
+enabled), query the indexed plugin docs instead:
+
+1. **Confirm the plugin name first — discover, don't guess.** Call
+   `rag_list_facets` to see the real indexed plugin names (grouped by namespace,
+   with doc counts). This mirrors how you call `pterodactyl_list_servers` to get
+   a real `server_id` before acting: pick `plugin:essentialsx` from the returned
+   values rather than recalling whether it is `essentialsx` or `essential-x`.
+2. **Search with that plugin filter.** Call `rag_search(query, plugin=<name>)`
+   using the confirmed name. `category` and `lang` are fixed enums
+   (`config`/`permissions`/`commands`/`faq`/`api`/`install`; `en`/`zh`) — set
+   them when they narrow the intent. Do not hand-craft raw `tags` strings; the
+   server fuzzy-normalizes `plugin` for you and **soft-relaxes** a filter that
+   matches nothing (the response `filter.relaxed=true` with a note tells you it
+   fell back to unfiltered results — treat those hits as less targeted).
+3. **Read deeper if a snippet is not enough.** Take a hit's `source_path` and
+   call `rag_get_document(source_path)` for the fuller (bounded) text.
+4. **Cite what you found** (the plugin + config key / node) before proposing a
+   change, then follow the normal read-diff-confirm-write workflow above.
+
+If the `rag_*` tools are not available, fall back to reading the plugin's own
+files on the server (`pterodactyl_read_file` on its `config.yml` under
+`/plugins`) and state that you could not consult external docs.
+
 ## Safety notes
 - Prefer `restart` over `kill`; `kill` can corrupt an unsaved world.
 - No backups are available on this panel — never rely on a restore to undo a

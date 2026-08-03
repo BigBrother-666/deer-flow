@@ -52,12 +52,20 @@ logger = logging.getLogger(__name__)
 # mangle legitimate *local* tool output (e.g. a ``file_search`` result). Robust
 # MCP coverage should tag remote-content tools via metadata at registration
 # rather than by name; tracked as a follow-up.
+# The ``pterodactyl_rag`` MCP server (backend/packages/pterodactyl-rag) returns
+# text ingested from third-party plugin documentation (README/wiki/PDF pages),
+# so ``rag_search`` snippets and ``rag_get_document`` full text are untrusted
+# remote content by the same logic as ``web_fetch`` — a plugin's docs could
+# carry forged framework tags. They normalize to fixed tool names here, so
+# unlike the arbitrary-name MCP case below they can be allowlisted directly.
 _REMOTE_CONTENT_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "web_fetch",
         "web_search",
         "image_search",
         "web_capture",
+        "rag_search",
+        "rag_get_document",
     }
 )
 
