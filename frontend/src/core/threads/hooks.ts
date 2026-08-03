@@ -41,7 +41,10 @@ import {
   filterThreadSearchResults,
   type ThreadSearchParams,
 } from "./thread-search-query";
-import { threadTokenUsageQueryKey } from "./token-usage";
+import {
+  retainThreadTokenUsagePlaceholder,
+  threadTokenUsageQueryKey,
+} from "./token-usage";
 import type {
   AgentThread,
   AgentThreadState,
@@ -163,6 +166,7 @@ export function buildThreadSubmitMessages({
 const EMPTY_MESSAGES: Message[] = [];
 const EMPTY_RUN_MESSAGES: RunMessage[] = [];
 const EMPTY_MESSAGE_IDENTITIES: readonly string[] = [];
+const INJECTED_USER_MESSAGE_ID_SUFFIX = "__user";
 
 const EMPTY_THREAD_VALUES: AgentThreadState = {
   title: "",
@@ -189,7 +193,17 @@ function messageIdentity(message: Message): string | undefined {
     return `tool:${message.tool_call_id}`;
   }
   if (typeof message.id === "string" && message.id.length > 0) {
-    return `message:${message.id}`;
+    // DynamicContextMiddleware replaces the submitted HumanMessage(id=X) with
+    // a hidden SystemMessage(id=X) and the real HumanMessage(id=X__user).
+    // Treat those human copies as one UI message so a committed render ledger
+    // cannot retain X beside the later checkpoint copy X__user.
+    const messageId =
+      message.type === "human" &&
+      message.id.endsWith(INJECTED_USER_MESSAGE_ID_SUFFIX)
+        ? message.id.slice(0, -INJECTED_USER_MESSAGE_ID_SUFFIX.length) ||
+          message.id
+        : message.id;
+    return `message:${messageId}`;
   }
   return undefined;
 }
@@ -579,6 +593,59 @@ export function mergeMessages(
 }
 
 /**
+ * Keep messages from a locally submitted turn behind that turn's user input.
+ * LangGraph `messages-tuple` events can publish the first AI/tool steps before
+ * the `values` event containing the user message. Those steps are not part of
+ * the pre-submit baseline, so move only that visible pending segment behind the
+ * first new human message without disturbing established history or hidden
+ * checkpoint controls. The caller keeps the baseline after stream completion
+ * because the SDK may retain its transient event order until the next submit.
+ */
+export function restoreLocalTurnMessageOrder(
+  messages: Message[],
+  baselineMessageIdentities: ReadonlySet<string>,
+): Message[] {
+  const pendingHumanIndex = messages.findIndex((message) => {
+    const identity = messageIdentity(message);
+    return (
+      message.type === "human" &&
+      !isHiddenFromUIMessage(message) &&
+      identity !== undefined &&
+      !baselineMessageIdentities.has(identity)
+    );
+  });
+  if (pendingHumanIndex <= 0) {
+    return messages;
+  }
+
+  const stablePrefix: Message[] = [];
+  const earlyPendingSteps: Message[] = [];
+  for (const message of messages.slice(0, pendingHumanIndex)) {
+    const identity = messageIdentity(message);
+    const isVisiblePendingStep =
+      (message.type === "ai" || message.type === "tool") &&
+      !isHiddenFromUIMessage(message) &&
+      identity !== undefined &&
+      !baselineMessageIdentities.has(identity);
+    if (isVisiblePendingStep) {
+      earlyPendingSteps.push(message);
+    } else {
+      stablePrefix.push(message);
+    }
+  }
+  if (earlyPendingSteps.length === 0) {
+    return messages;
+  }
+
+  return [
+    ...stablePrefix,
+    messages[pendingHumanIndex]!,
+    ...earlyPendingSteps,
+    ...messages.slice(pendingHumanIndex + 1),
+  ];
+}
+
+/**
  * Keep a run-scoped ledger of every visible message that reached a committed
  * UI frame. Live checkpoint windows can roll forward between two
  * summarization events; replacing this ledger with only the newest window
@@ -916,6 +983,27 @@ function getMessagesAfterBaseline(
     const id = messageIdentity(message);
     return !id || !baselineMessageIds.has(id);
   });
+}
+
+/**
+ * Human-message baseline for a prepared replay (regenerate / edit).
+ *
+ * A replay masks the turn it supersedes, so those messages leave the live
+ * message list the moment the mask is applied. Baselining on the pre-mask count
+ * means the replacement only ever restores the count instead of exceeding it,
+ * and the optimistic copy is never recognised as confirmed. That matters for
+ * the first turn of a thread, where the runtime re-keys the replacement message
+ * so identity comparison cannot stand in for the count either.
+ */
+export function countHumanMessagesExcludingSuperseded(
+  messages: Message[],
+  supersededMessageIds: readonly string[],
+): number {
+  const superseded = new Set(supersededMessageIds);
+  return messages.filter(
+    (message) =>
+      message.type === "human" && (!message.id || !superseded.has(message.id)),
+  ).length;
 }
 
 export function getVisibleOptimisticMessages(
@@ -1446,9 +1534,12 @@ export function useThreadStream({
     threadId: onStreamThreadId,
     reconnectOnMount: true,
     fetchStateHistory: { limit: 1 },
+    // Batch stream updates received in the same macrotask without adding a
+    // fixed debounce interval that could delay a continuously active stream.
     // Coalesce same-tick stream events into one React notification. Only the
     // boolean tier is safe: the SDK's numeric tier is a trailing debounce that
     // starves UI updates while chunks keep arriving faster than the window.
+    // Keep explicit: SDK types claim @default true, but runtime uses throttle ?? false.
     throttle: true,
     onCreated(meta) {
       handleStreamStart(meta.thread_id, meta.run_id);
@@ -1588,6 +1679,7 @@ export function useThreadStream({
         transientHistoryThreadIdRef.current = null;
         summarizedRef.current = new Set<string>();
         pendingUsageBaselineMessageIdsRef.current = new Set();
+        localTurnOrderBaselineIdentitiesRef.current = null;
         tasksRef.current = {};
         setTasks({});
         invalidateStoppedThreadCaches(queryClient, threadIdRef.current, isMock);
@@ -1707,6 +1799,12 @@ export function useThreadStream({
   const latestMessageCountsRef = useRef({ humanMessageCount });
   const sendInFlightRef = useRef(false);
   const messagesRef = useRef<Message[]>([]);
+  // Non-null only after a turn submitted by this mounted client. Keep it after
+  // finish/stop/error because the SDK can retain its transient event order in
+  // the settled frame. The next local submit replaces it and a thread switch or
+  // replay gap clears it. An empty set is meaningful for a new thread and must
+  // not be confused with a reconnect that has no local turn anchor.
+  const localTurnOrderBaselineIdentitiesRef = useRef<Set<string> | null>(null);
   // Current-stream lifecycle bridge for messages removed from the checkpoint
   // tail before the canonical run-event page refetch observes the journal
   // flush. It is never appended into useThreadHistory's persisted pages.
@@ -1755,6 +1853,7 @@ export function useThreadStream({
     };
     summarizedRef.current = new Set<string>();
     pendingUsageBaselineMessageIdsRef.current = new Set();
+    localTurnOrderBaselineIdentitiesRef.current = null;
     pendingPreparedReplayRef.current = null;
     setPendingSupersededRunIds(new Set());
     setPendingSupersededMessageIds(new Set());
@@ -1855,6 +1954,9 @@ export function useThreadStream({
         persistedMessages
           .map(messageIdentity)
           .filter((id): id is string => Boolean(id)),
+      );
+      localTurnOrderBaselineIdentitiesRef.current = new Set(
+        pendingUsageBaselineMessageIdsRef.current,
       );
 
       // Build optimistic files list with uploading status
@@ -2022,6 +2124,7 @@ export function useThreadStream({
         setOptimisticThreadId(null);
         setLiveMessagesThreadId(null);
         setIsUploading(false);
+        localTurnOrderBaselineIdentitiesRef.current = null;
         throw error;
       } finally {
         sendInFlightRef.current = false;
@@ -2059,6 +2162,9 @@ export function useThreadStream({
           .map(messageIdentity)
           .filter((id): id is string => Boolean(id)),
       );
+      localTurnOrderBaselineIdentitiesRef.current = new Set(
+        pendingUsageBaselineMessageIdsRef.current,
+      );
       setLiveMessagesThreadId(threadId);
       listeners.current.onSend?.(threadId);
       let preparedSupersededRunId: string | null = null;
@@ -2068,6 +2174,10 @@ export function useThreadStream({
         const prepared = await prepare();
         preparedSupersededRunId = prepared.target_run_id;
         preparedSupersededMessageIds = getSupersededMessageIds(prepared);
+        prevHumanMsgCountRef.current = countHumanMessagesExcludingSuperseded(
+          persistedMessages,
+          preparedSupersededMessageIds,
+        );
         const replacementHumanMessageId =
           "replacement_human_message_id" in prepared &&
           typeof prepared.replacement_human_message_id === "string"
@@ -2141,6 +2251,7 @@ export function useThreadStream({
         setOptimisticMessages([]);
         setOptimisticThreadId(null);
         setLiveMessagesThreadId(null);
+        localTurnOrderBaselineIdentitiesRef.current = null;
         if (preparedSupersededRunId) {
           const supersededRunId = preparedSupersededRunId;
           pendingPreparedReplayRef.current = null;
@@ -2301,11 +2412,15 @@ export function useThreadStream({
       transientHistoryOrder,
       previouslyRenderedOrder,
     );
-    return mergeMessages(
+    const merged = mergeMessages(
       effectiveHistory,
       renderMessages,
       visibleOptimisticMessages,
     );
+    const localTurnOrderBaseline = localTurnOrderBaselineIdentitiesRef.current;
+    return localTurnOrderBaseline === null
+      ? merged
+      : restoreLocalTurnMessageOrder(merged, localTurnOrderBaseline);
   }, [
     previouslyRenderedOrder,
     renderMessages,
@@ -2371,6 +2486,11 @@ type ThreadHistoryOptions = {
   pendingSupersededRunIds?: ReadonlySet<string>;
 };
 
+export const THREAD_HISTORY_QUERY_POLICY = {
+  refetchOnWindowFocus: false,
+  staleTime: 5 * 60 * 1_000,
+} as const;
+
 export function useThreadHistory(
   threadId: string,
   { enabled = true, pendingSupersededRunIds }: ThreadHistoryOptions = {},
@@ -2382,6 +2502,7 @@ export function useThreadHistory(
     ReturnType<typeof threadHistoryQueryKey>,
     number | null
   >({
+    ...THREAD_HISTORY_QUERY_POLICY,
     queryKey: threadHistoryQueryKey(threadId),
     enabled: enabled && Boolean(threadId),
     initialPageParam: null,
@@ -2743,6 +2864,10 @@ export function useThreadTokenUsage(
     enabled: enabled && Boolean(threadId),
     retry: false,
     refetchOnWindowFocus: false,
+    // Keep same-thread data visible during refetches without carrying usage
+    // from the previous route into a newly selected thread.
+    placeholderData: (previous) =>
+      retainThreadTokenUsagePlaceholder(previous, threadId),
   });
 }
 
