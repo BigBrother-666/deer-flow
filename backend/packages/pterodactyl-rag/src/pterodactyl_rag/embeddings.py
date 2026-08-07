@@ -45,7 +45,7 @@ class OpenAIEmbedder:
         api_key: str,
         model: str,
         dim: int,
-        base_url: str | None = None,
+        url: str | None = None,
         batch_size: int = 64,
         max_retries: int = 5,
         timeout: float = 60.0,
@@ -54,7 +54,7 @@ class OpenAIEmbedder:
         self._api_key = api_key
         self._model = model
         self._dim = dim
-        self._base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+        self._url = (url or "https://api.openai.com/v1").rstrip("/")
         self._batch_size = max(batch_size, 1)
         self._max_retries = max(max_retries, 1)
         self._timeout = timeout
@@ -76,7 +76,7 @@ class OpenAIEmbedder:
         return self._client
 
     def _is_local_endpoint(self) -> bool:
-        host = urlparse(self._base_url).hostname or ""
+        host = urlparse(self._url).hostname or ""
         return host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
     async def aclose(self) -> None:
@@ -92,7 +92,7 @@ class OpenAIEmbedder:
 
     async def _embed_batch(self, batch: list[str]) -> list[list[float]]:
         client = await self._get_client()
-        url = f"{self._base_url}/embeddings"
+        url = f"{self._url}"
         headers = {"Authorization": f"Bearer {self._api_key}"}
         payload = {"model": self._model, "input": batch}
 

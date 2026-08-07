@@ -53,7 +53,7 @@ async def _run_ingest(settings: Settings, *, prune: bool) -> int:
         api_key=settings.embed_api_key or "",
         model=settings.embed_model,
         dim=settings.embed_dim,
-        base_url=settings.embed_base_url,
+        base_url=settings.embed_url,
     )
     report = await ingest(
         docs_dir,

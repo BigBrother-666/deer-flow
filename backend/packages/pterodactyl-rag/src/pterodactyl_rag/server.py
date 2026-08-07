@@ -151,7 +151,7 @@ def build_embedder(settings: Settings) -> Embedder:
         api_key=settings.embed_api_key or "",
         model=settings.embed_model,
         dim=settings.embed_dim,
-        base_url=settings.embed_base_url,
+        url=settings.embed_url,
     )
 
 
