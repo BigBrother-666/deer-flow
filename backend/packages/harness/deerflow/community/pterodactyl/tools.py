@@ -433,7 +433,7 @@ def _resolve_workspace_dir(runtime: Any) -> Path:
     if not thread_id:
         raise PterodactylError("No active thread; cannot resolve a download directory.")
     user_id = (resolve_runtime_user_id(runtime) if runtime is not None else None) or get_effective_user_id()
-    workspace = get_paths().sandbox_workspace_dir(thread_id, user_id=user_id)
+    workspace = get_paths().sandbox_work_dir(thread_id, user_id=user_id)
     workspace.mkdir(parents=True, exist_ok=True)
     return workspace
 
