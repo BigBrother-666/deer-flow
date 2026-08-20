@@ -32,6 +32,8 @@ services:
       - ../backend/packages/pterodactyl-rag/pyproject.toml:/app/pyproject.toml
       - ../backend/packages/pterodactyl-rag/uv.lock:/app/uv.lock
       - rag-mcp-venv:/app/.venv
+    ports:
+      - "8000:8000"
 
 volumes:
   rag-mcp-venv:
