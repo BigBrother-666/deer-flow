@@ -104,10 +104,11 @@ class OpenAIEmbedder:
                 last_exc = exc
             else:
                 if resp.status_code == 200:
-                    data = resp.json()["data"]
-                    # Preserve request order regardless of server ordering.
-                    ordered = sorted(data, key=lambda d: d["index"])
-                    return [item["embedding"] for item in ordered]
+                    logger.info(resp.json())
+                    vecs = resp.json()["embeddings"]
+                    # # Preserve request order regardless of server ordering.
+                    # ordered = sorted(data, key=lambda d: d["index"])
+                    return vecs
                 if resp.status_code not in _RETRYABLE_STATUS:
                     raise EmbeddingError(f"Embedding request failed [{resp.status_code}]: {resp.text[:200]}")
                 last_exc = EmbeddingError(f"retryable status {resp.status_code}")
