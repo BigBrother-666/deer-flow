@@ -24,6 +24,7 @@ in-memory store and a fake embedder without a live database or MCP transport
 from __future__ import annotations
 
 import logging
+import traceback
 from typing import Literal
 
 from .config import Settings
@@ -88,6 +89,7 @@ class RagService:
             )
         except Exception as exc:  # noqa: BLE001 — surface as recoverable note, never abort the run.
             logger.warning("rag_search failed: %s", exc)
+            traceback.print_exc()
             return {"hits": [], "filter": {"applied": [], "relaxed": False, "note": f"Search failed: {exc}"}}
         return response.as_dict()
 
@@ -151,7 +153,7 @@ def build_embedder(settings: Settings) -> Embedder:
         api_key=settings.embed_api_key or "",
         model=settings.embed_model,
         dim=settings.embed_dim,
-        base_url=settings.embed_base_url,
+        url=settings.embed_url,
     )
 
 

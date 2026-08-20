@@ -1,6 +1,6 @@
 # DeerFlow - Unified Development Environment
 
-.PHONY: help config config-upgrade check install setup doctor support-bundle detect-thread-boundaries detect-blocking-io dev dev-daemon start start-daemon nginx stop up down clean docker-init docker-start docker-stop docker-restart docker-logs docker-logs-frontend docker-logs-gateway docker-logs-redis rag-stack-up rag-stack-up-dev rag-stack-down rag-stack-logs rag-ingest-docker pg-up pg-down pg-restart pg-destroy pg-logs stack-up stack-up-dev stack-down stack-restart rag-ingest rag-serve rag-stats rag-reset
+.PHONY: help config config-upgrade check install setup doctor support-bundle detect-thread-boundaries detect-blocking-io dev dev-daemon start start-daemon nginx stop up down clean docker-init docker-start docker-stop docker-restart docker-logs docker-logs-frontend docker-logs-gateway docker-logs-redis rag-stack-up rag-stack-up-dev rag-stack-down rag-stack-restart rag-stack-logs rag-ingest-docker pg-up pg-down pg-restart pg-destroy pg-logs stack-up stack-up-dev stack-down stack-restart rag-ingest rag-serve rag-stats rag-reset langfuse-up langfuse-down langfuse-restart langfuse-logs
 
 BASH ?= bash
 BACKEND_UV_RUN = cd backend && uv run
@@ -13,6 +13,9 @@ RAG_COMPOSE_FILE = docker/docker-compose.rag.yaml
 # `runtime` stage with code baked in — mirroring DeerFlow's own dev/prod split.
 RAG_DEV_COMPOSE_FILE = docker/docker-compose.rag.dev.yaml
 RAG_DIR = backend/packages/pterodactyl-rag
+# Langfuse tracing backend (self-hosted, docker compose). Reads LANGFUSE_* from
+# root .env via the compose env_file.
+LANGFUSE_COMPOSE_FILE = docker/docker-compose.langfuse.yaml
 # Root .env holds the RAG secrets/paths (PTERO_RAG_*). Unlike docker compose,
 # neither make nor `uv run` auto-loads it, so the rag-* targets source it
 # themselves at runtime. Values stay in the gitignored .env; nothing is inlined.
@@ -70,6 +73,7 @@ help:
 	@echo "  make rag-stack-up      - Build + start the RAG stack, prod mode (code baked in); creates shared network"
 	@echo "  make rag-stack-up-dev  - Build + start the RAG stack, dev mode (source bind-mounted, watchfiles hot-reload)"
 	@echo "  make rag-stack-down    - Stop and remove the RAG stack"
+	@echo "  make rag-stack-restart - Restart the RAG stack"
 	@echo "  make rag-stack-logs    - Tail RAG stack logs (postgres + rag-mcp)"
 	@echo "  make rag-ingest-docker - One-shot docs ingest inside the stack (mounts PTERO_RAG_DOCS_DIR)"
 	@echo ""
@@ -91,6 +95,12 @@ help:
 	@echo "  make rag-serve       - Run the RAG MCP server in the foreground"
 	@echo "  make rag-stats       - Print vector-store index health"
 	@echo "  make rag-reset       - Drop the RAG schema (destructive; asks for env RAG_RESET_YES=1)"
+	@echo ""
+	@echo "Langfuse Tracing Backend (docker compose) Commands:"
+	@echo "  make langfuse-up      - Start the self-hosted Langfuse stack (UI at LANGFUSE_BASE_URL)"
+	@echo "  make langfuse-down    - Stop and remove the Langfuse stack (keeps data volume)"
+	@echo "  make langfuse-restart - Restart the Langfuse stack"
+	@echo "  make langfuse-logs    - Tail Langfuse logs"
 
 ## Setup & Diagnosis
 setup:
@@ -245,6 +255,9 @@ rag-stack-up-dev:
 rag-stack-down:
 	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) down
 
+rag-stack-restart:
+	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) restart
+
 # Tail RAG extension stack logs (postgres + rag-mcp)
 rag-stack-logs:
 	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) logs -f
@@ -286,16 +299,16 @@ pg-logs:
 
 # Start the RAG extension stack first (creates deer-flow-shared), then the dev stack.
 # RAG runs in prod mode (code baked in); use stack-up-dev for RAG hot-reload.
-stack-up: rag-stack-up docker-start
+stack-up: rag-stack-up up langfuse-up
 
 # Full dev stack with RAG hot-reload: RAG dev overlay first, then the dev stack.
-stack-up-dev: rag-stack-up-dev docker-start
+stack-up-dev: rag-stack-up-dev docker-start langfuse-up
 
 # Stop the Docker dev stack first, then the RAG extension stack
-stack-down: docker-stop rag-stack-down
+stack-down: langfuse-down docker-stop rag-stack-down
 
 # Restart the RAG extension stack and the Docker dev stack
-stack-restart: rag-stack-up docker-restart
+stack-restart: rag-stack-restart langfuse-restart docker-restart
 
 # ==========================================
 # Plugin-Docs RAG Vector Store Commands
@@ -327,3 +340,31 @@ else
 	@echo "Re-run with: RAG_RESET_YES=1 make rag-reset"
 	@exit 1
 endif
+
+# ==========================================
+# Langfuse Tracing Backend Commands
+# ==========================================
+# Self-hosted Langfuse v4 stack (docker/docker-compose.langfuse.yaml). Set the
+# LANGFUSE_* keys in the root .env; unlike docker compose's own auto-load, that
+# root .env is sourced here via LOAD_DOTENV so compose can interpolate it (the
+# compose file is under docker/, not the repo root). Point DeerFlow at this
+# instance with LANGFUSE_BASE_URL / LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY;
+# the compose LANGFUSE_INIT_* block seeds a project with those same keys on
+# first boot, so tracing works with no manual UI setup.
+
+# Start the Langfuse stack
+langfuse-up:
+	@$(LOAD_DOTENV) $(DOCKER_COMPOSE) -f $(LANGFUSE_COMPOSE_FILE) up -d
+	@echo "✓ Langfuse up on $${LANGFUSE_BASE_URL:-http://localhost:3000}"
+
+# Stop and remove the Langfuse stack (keeps the data volumes)
+langfuse-down:
+	@$(LOAD_DOTENV) $(DOCKER_COMPOSE) -f $(LANGFUSE_COMPOSE_FILE) down
+
+# Restart the Langfuse stack
+langfuse-restart:
+	@$(LOAD_DOTENV) $(DOCKER_COMPOSE) -f $(LANGFUSE_COMPOSE_FILE) restart
+
+# Tail Langfuse logs
+langfuse-logs:
+	@$(LOAD_DOTENV) $(DOCKER_COMPOSE) -f $(LANGFUSE_COMPOSE_FILE) logs -f

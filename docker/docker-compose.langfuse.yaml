@@ -1,0 +1,197 @@
+# Self-hosted Langfuse v4 tracing backend for DeerFlow.
+# Usage: make langfuse-up / langfuse-down / langfuse-restart / langfuse-logs
+#
+# v4 is a multi-service stack (unlike the old v2 single container):
+#   - langfuse-web:    UI + ingestion API + OTel trace endpoint (host :3000)
+#   - langfuse-worker: async ingestion/eval worker
+#   - postgres:        transactional store (projects, users, config)
+#   - clickhouse:      OLAP store for traces/observations/scores
+#   - redis:           queue + cache
+#   - minio:           S3-compatible blob store for event/media payloads
+#
+# DeerFlow points at this via the root .env:
+#   LANGFUSE_BASE_URL=http://localhost:3000
+#   LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY
+# The LANGFUSE_INIT_* block below seeds a project on first boot using THOSE
+# same keys, so the SDK (v4, OTel transport) works with no manual UI setup.
+#
+# Secrets: this file does NOT blanket-load ../.env (that would leak every
+# unrelated app secret into the langfuse containers). Only langfuse-scoped
+# values are injected, with safe local-dev defaults you can override in .env:
+#   LANGFUSE_SALT, LANGFUSE_ENCRYPTION_KEY (64 hex chars), LANGFUSE_NEXTAUTH_SECRET
+#   LANGFUSE_DB_PASSWORD, LANGFUSE_CLICKHOUSE_PASSWORD, LANGFUSE_REDIS_AUTH,
+#   LANGFUSE_MINIO_ROOT_PASSWORD
+# Generate strong values for any real/shared deployment, e.g.:
+#   openssl rand -hex 32   # ENCRYPTION_KEY
+#   openssl rand -base64 32 # SALT / NEXTAUTH_SECRET
+
+x-langfuse-shared-env: &langfuse-shared-env
+  DATABASE_URL: postgresql://langfuse:${LANGFUSE_DB_PASSWORD:-langfuse}@langfuse-db:5432/langfuse
+  SALT: ${LANGFUSE_SALT:-deer-flow-langfuse-salt}
+  ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+  TELEMETRY_ENABLED: ${LANGFUSE_TELEMETRY_ENABLED:-true}
+  LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-true}
+  CLICKHOUSE_MIGRATION_URL: ${LANGFUSE_CLICKHOUSE_MIGRATION_URL:-clickhouse://langfuse-clickhouse:9000}
+  CLICKHOUSE_URL: ${LANGFUSE_CLICKHOUSE_URL:-http://langfuse-clickhouse:8123}
+  CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-clickhouse}
+  CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse}
+  CLICKHOUSE_CLUSTER_ENABLED: ${LANGFUSE_CLICKHOUSE_CLUSTER_ENABLED:-false}
+  LANGFUSE_USE_AZURE_BLOB: ${LANGFUSE_USE_AZURE_BLOB:-false}
+  LANGFUSE_USE_GOOGLE_CLOUD_STORAGE: ${LANGFUSE_USE_GOOGLE_CLOUD_STORAGE:-false}
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-auto}
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_ROOT_USER:-minio}
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_ROOT_PASSWORD:-miniosecret}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_ENDPOINT:-http://langfuse-minio:9000}
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_ROOT_USER:-minio}
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_ROOT_PASSWORD:-miniosecret}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_ENDPOINT:-http://langfuse-minio:9000}
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+  REDIS_HOST: langfuse-redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${LANGFUSE_REDIS_AUTH:-langfuse-redis}
+  REDIS_TLS_ENABLED: "false"
+
+services:
+  langfuse-web:
+    image: langfuse/langfuse:4
+    container_name: deer-flow-langfuse
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+    ports:
+      - "${LANGFUSE_PORT:-3000}:3000"
+    environment:
+      <<: *langfuse-shared-env
+      NEXTAUTH_URL: ${LANGFUSE_BASE_URL:-http://localhost:3000}
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-deer-flow-langfuse-nextauth-secret}
+    networks:
+      - deer-flow-shared
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:4
+    container_name: deer-flow-langfuse-worker
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+    # Loopback-only: worker admin port is never a public surface.
+    ports:
+      - "127.0.0.1:3030:3030"
+    environment:
+      <<: *langfuse-shared-env
+    networks:
+      - deer-flow-shared
+
+  langfuse-db:
+    image: postgres:17
+    container_name: deer-flow-langfuse-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD:-langfuse}
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - deer-flow-shared
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:25.12
+    container_name: deer-flow-langfuse-clickhouse
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    # Loopback-only host ports for local debugging; container talk stays internal.
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - deer-flow-shared
+
+  langfuse-minio:
+    image: minio/minio:latest
+    container_name: deer-flow-langfuse-minio
+    restart: unless-stopped
+    entrypoint: sh
+    # Ensure the langfuse bucket exists before starting the server.
+    command: -c 'mkdir -p /data/langfuse && minio server /data --console-address ":9001"'
+    environment:
+      MINIO_ROOT_USER: ${LANGFUSE_MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_ROOT_PASSWORD:-miniosecret}
+    volumes:
+      - langfuse_minio_data:/data
+    # Loopback-only host ports (S3 API + console) for local debugging.
+    ports:
+      - "127.0.0.1:9090:9000"
+      - "127.0.0.1:9091:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - deer-flow-shared
+
+  langfuse-redis:
+    image: redis:7
+    container_name: deer-flow-langfuse-redis
+    restart: unless-stopped
+    command: >
+      --requirepass ${LANGFUSE_REDIS_AUTH:-langfuse-redis}
+      --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${LANGFUSE_REDIS_AUTH:-langfuse-redis}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - deer-flow-shared
+
+volumes:
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+
+networks:
+  deer-flow-shared:
+    name: deer-flow-shared
+    driver: bridge
