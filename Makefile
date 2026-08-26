@@ -242,13 +242,13 @@ down:
 # Start the whole RAG extension stack, PROD mode (rag-mcp code baked into the
 # image, no watcher; builds the `runtime` stage; creates the shared network)
 rag-stack-up:
-	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) up -d --build
+	@$(LOAD_DOTENV) $(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) up -d --build
 	@echo "✓ RAG stack up (prod): deer-flow-postgres + deer-flow-rag-mcp (http://rag-mcp:8000/mcp)"
 
 # Start the RAG extension stack, DEV mode (rag-mcp source bind-mounted, watchfiles
 # hot-reload; builds the `dev` stage via the dev overlay compose)
 rag-stack-up-dev:
-	@$(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) -f $(RAG_DEV_COMPOSE_FILE) up -d --build
+	@$(LOAD_DOTENV) $(DOCKER_COMPOSE) -f $(RAG_COMPOSE_FILE) -f $(RAG_DEV_COMPOSE_FILE) up -d --build
 	@echo "✓ RAG stack up (dev, hot-reload): deer-flow-postgres + deer-flow-rag-mcp (http://rag-mcp:8000/mcp)"
 
 # Stop and remove the RAG extension stack (keeps the data volume)
