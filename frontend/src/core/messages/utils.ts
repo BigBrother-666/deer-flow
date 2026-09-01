@@ -363,15 +363,74 @@ type MessageMetadataLookup = (
   index: number,
 ) => { streamMetadata?: Record<string, unknown> } | undefined;
 
+export type StreamMetadataSnapshot = {
+  ids: ReadonlyMap<string, Record<string, unknown>>;
+  messages: ReadonlyMap<Message, Record<string, unknown>>;
+};
+
 export type StreamingMessageLookup = {
   ids: ReadonlySet<string>;
   messages: ReadonlySet<Message>;
 };
 
+export function areStreamMetadataSnapshotsEqual(
+  left: StreamMetadataSnapshot,
+  right: StreamMetadataSnapshot,
+) {
+  if (
+    left.ids.size !== right.ids.size ||
+    left.messages.size !== right.messages.size
+  ) {
+    return false;
+  }
+
+  for (const [id, metadata] of left.ids) {
+    if (right.ids.get(id) !== metadata) {
+      return false;
+    }
+  }
+  for (const [message, metadata] of left.messages) {
+    if (right.messages.get(message) !== metadata) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function getStreamMetadataSnapshot(
+  messages: Message[],
+  getMessagesMetadata?: MessageMetadataLookup,
+): StreamMetadataSnapshot {
+  const metadataById = new Map<string, Record<string, unknown>>();
+  const metadataByMessage = new Map<Message, Record<string, unknown>>();
+
+  messages.forEach((message, index) => {
+    const streamMetadata = getMessagesMetadata?.(
+      message,
+      index,
+    )?.streamMetadata;
+    if (!streamMetadata) {
+      return;
+    }
+
+    if (typeof message.id === "string" && message.id.length > 0) {
+      metadataById.set(message.id, streamMetadata);
+    } else {
+      metadataByMessage.set(message, streamMetadata);
+    }
+  });
+
+  return {
+    ids: metadataById,
+    messages: metadataByMessage,
+  };
+}
+
 export function getStreamingMessageLookup(
   messages: Message[],
   isStreaming: boolean,
   getMessagesMetadata?: MessageMetadataLookup,
+  settledMetadata?: StreamMetadataSnapshot,
 ): StreamingMessageLookup {
   const streamingMessageIds = new Set<string>();
   const streamingMessages = new Set<Message>();
@@ -384,12 +443,25 @@ export function getStreamingMessageLookup(
   }
 
   messages.forEach((message, index) => {
-    if (!getMessagesMetadata?.(message, index)?.streamMetadata) {
+    const streamMetadata = getMessagesMetadata?.(
+      message,
+      index,
+    )?.streamMetadata;
+    if (!streamMetadata) {
       return;
     }
 
     if (typeof message.id === "string" && message.id.length > 0) {
+      // MessageTupleManager retains metadata until the whole stream instance is
+      // cleared. A later run therefore exposes the completed turn's metadata
+      // again. Only an unchanged metadata object is stale: a new object for the
+      // same message id means that message received another stream event.
+      if (settledMetadata?.ids.get(message.id) === streamMetadata) {
+        return;
+      }
       streamingMessageIds.add(message.id);
+    } else if (settledMetadata?.messages.get(message) === streamMetadata) {
+      return;
     }
     streamingMessages.add(message);
   });
@@ -418,6 +490,18 @@ export function isAssistantMessageGroupStreaming(
   });
 }
 
+// `deriveStableMessageGroups` preserves the identity of a settled group's
+// `messages` array across streaming chunks, so caching on that array lets the
+// message list re-render per chunk without re-running the derivation for
+// every settled turn (#5094). For string-content turns the saved work is the
+// reverse/filter/map traversal and its allocations — the regex/trim split
+// itself is already cached per message by `inlineReasoningCache`; for
+// array-content turns `extractContentFromMessage` has no lower-level cache,
+// so this also skips its O(bytes) map/join/trim re-run. Settled group arrays
+// are treated as immutable everywhere else, so the same reference always
+// yields the same result.
+const assistantTurnCopyDataCache = new WeakMap<Message[], string>();
+
 export function getAssistantTurnCopyData(
   messages: Message[],
   { isStreaming = false }: { isStreaming?: boolean } = {},
@@ -426,7 +510,12 @@ export function getAssistantTurnCopyData(
     return null;
   }
 
-  return (
+  const cached = assistantTurnCopyDataCache.get(messages);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const copyData =
     [...messages]
       .reverse()
       .filter((message) => message.type === "ai")
@@ -439,8 +528,11 @@ export function getAssistantTurnCopyData(
           ? content
           : (extractReasoningContentFromMessage(message) ?? "");
       })
-      .find((content) => content.length > 0) ?? null
-  );
+      .find((content) => content.length > 0) ?? null;
+  if (copyData !== null) {
+    assistantTurnCopyDataCache.set(messages, copyData);
+  }
+  return copyData;
 }
 
 export function getMessageCopyData(message: Message) {

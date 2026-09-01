@@ -7,19 +7,22 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.gateway.deps import require_admin_user
 from deerflow.config.extensions_config import (
     ExtensionsConfig,
     McpRoutingConfig,
+    McpTaskToolsetConfig,
     McpToolOverride,
     atomic_write_extensions_config,
+    extensions_config_file_lock,
     extensions_config_write_lock,
     get_extensions_config,
     normalize_mcp_transport_alias,
     reload_extensions_config,
 )
+from deerflow.constants import DEFAULT_MCP_SESSION_INIT_TIMEOUT
 from deerflow.mcp.cache import reset_mcp_tools_cache
 
 logger = logging.getLogger(__name__)
@@ -344,6 +347,66 @@ _CODE_INJECTING_ENV_VARS = frozenset(
 )
 
 
+class McpUserScopedAuthConfigResponse(BaseModel):
+    """Per-user credential injection configuration for an MCP server."""
+
+    enabled: bool = Field(default=True, description="Whether user-scoped credential injection is enabled")
+    header: str = Field(default="Authorization", description="HTTP header to set with the resolved user credential")
+    users: dict[str, str] = Field(default_factory=dict, description="Map of DeerFlow user id to credential header value")
+    on_missing: Literal["deny", "passthrough"] = Field(default="deny", description="Behavior when the calling user has no mapped credential")
+    # Mirror the harness-side McpUserScopedAuthConfig (extra="allow"): without
+    # this, an operator's unknown key inside user_auth would be silently
+    # stripped by the next admin PUT, while server-level extras are preserved.
+    model_config = ConfigDict(extra="allow")
+
+    # Mirror the harness-side non-blank check: a blank header accepted here
+    # would be persisted, then fail ExtensionsConfig validation on reload —
+    # wedging every subsequent config load until the file is hand-edited.
+    @field_validator("header")
+    @classmethod
+    def _validate_header_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("user_auth.header must not be empty")
+        return value
+
+
+class McpContextHeadersConfigResponse(BaseModel):
+    """Per-request credential injection configuration for an MCP server.
+
+    Holds header names and run-context key names only — never a credential —
+    so unlike ``user_auth`` its declared fields are returned unmasked by GET.
+    """
+
+    enabled: bool = Field(default=True, description="Whether request-scoped header injection is enabled")
+    headers: dict[str, str] = Field(
+        default_factory=dict,
+        description="Map of HTTP header name to the key read from the run request's config.context.secrets",
+    )
+    on_missing: Literal["deny", "passthrough"] = Field(default="deny", description="Behavior when a mapped key is absent from the request secrets")
+    # Mirror the harness-side McpContextHeadersConfig (extra="allow"): without
+    # this, an operator's unknown key inside headers_from_context would be
+    # silently stripped by the next admin PUT.
+    model_config = ConfigDict(extra="allow")
+
+    # Mirror the harness-side entry check: a blank name accepted here would be
+    # persisted, then fail ExtensionsConfig validation on reload — wedging every
+    # subsequent config load until the file is hand-edited.
+    @field_validator("headers")
+    @classmethod
+    def _validate_mapping_entries(cls, value: dict[str, str]) -> dict[str, str]:
+        seen: dict[str, str] = {}
+        for header_name, secret_key in value.items():
+            if not header_name.strip():
+                raise ValueError("headers_from_context.headers must not contain a blank header name")
+            if not isinstance(secret_key, str) or not secret_key.strip():
+                raise ValueError(f"headers_from_context.headers[{header_name!r}] must name a non-blank secret key from config.context.secrets")
+            lowered = header_name.lower()
+            if lowered in seen:
+                raise ValueError(f"headers_from_context.headers maps the same HTTP header under two spellings ({seen[lowered]!r} and {header_name!r}); header names are case-insensitive, so keep only one")
+            seen[lowered] = header_name
+        return value
+
+
 class McpOAuthConfigResponse(BaseModel):
     """OAuth configuration for an MCP server."""
 
@@ -374,12 +437,44 @@ class McpServerConfigResponse(BaseModel):
     url: str | None = Field(default=None, description="URL of the MCP server (for sse or http type)")
     headers: dict[str, str] = Field(default_factory=dict, description="HTTP headers to send (for sse or http type)")
     oauth: McpOAuthConfigResponse | None = Field(default=None, description="OAuth configuration for MCP HTTP/SSE servers")
+    user_auth: McpUserScopedAuthConfigResponse | None = Field(default=None, description="Per-user credential injection for MCP HTTP/SSE servers")
+    headers_from_context: McpContextHeadersConfigResponse | None = Field(default=None, description="Per-request credential injection for MCP HTTP/SSE servers: map header names to config.context.secrets keys")
     description: str = Field(default="", description="Human-readable description of what this MCP server provides")
     routing: McpRoutingConfig = Field(default_factory=McpRoutingConfig, description="Soft routing hints for tools from this MCP server")
     tools: dict[str, McpToolOverride] = Field(default_factory=dict, description="Per-original-tool MCP configuration overrides")
     tool_name_prefix: bool = Field(default=True, description="Whether to prefix discovered tool names with the MCP server name")
-    tool_call_timeout: float | None = Field(default=None, description="Timeout in seconds for individual stdio MCP tool calls")
+    tool_call_timeout: float | None = Field(
+        default=None,
+        description="Timeout in seconds for individual stdio MCP calls and durable-task calls on every transport",
+    )
+    # Default matches McpServerConfig: this model's defaults feed model_dump()
+    # into the persisted extensions config on PUT, so an API-created server that
+    # omits the field must get the same bring-up timeout as a file-created one.
+    session_init_timeout: float | None = Field(
+        default=DEFAULT_MCP_SESSION_INIT_TIMEOUT,
+        description="Timeout in seconds for MCP server bring-up and durable HTTP/SSE task-session initialization; null means no timeout",
+    )
+    task_toolsets: list[McpTaskToolsetConfig] = Field(
+        default_factory=list,
+        description="Raw submit/status/cancel tool groups managed as durable background tasks",
+    )
     model_config = ConfigDict(extra="allow")
+
+    @field_validator("headers")
+    @classmethod
+    def _validate_header_names(cls, value: dict[str, str]) -> dict[str, str]:
+        # Mirror the harness-side McpServerConfig check: HTTP field names are
+        # case-insensitive, so a config carrying one header under two spellings
+        # would persist, reload into a connection with both fields, and let a
+        # later override replace only one of them. Reject at the API boundary
+        # instead of wedging the next ExtensionsConfig reload.
+        seen: dict[str, str] = {}
+        for header_name in value:
+            lowered = header_name.lower()
+            if lowered in seen:
+                raise ValueError(f"headers maps the same HTTP header under two spellings ({seen[lowered]!r} and {header_name!r}); header names are case-insensitive, so keep only one")
+            seen[lowered] = header_name
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -636,12 +731,30 @@ def _mask_server_config(server: McpServerConfigResponse) -> McpServerConfigRespo
                 "refresh_token": None,
             }
         )
+    masked_user_auth = None
+    if server.user_auth is not None:
+        # Extras inside user_auth get the same sensitive-key masking as
+        # server-level extras: they round-trip through PUT (extra="allow"), so
+        # an operator-stored secret-bearing key must not come back in
+        # cleartext from GET while the identical key at server level is masked.
+        masked_ua_extra = {key: _MASKED_VALUE if _is_sensitive_extra_key(key) else _mask_sensitive_extra_value(value) for key, value in (server.user_auth.model_extra or {}).items()}
+        masked_user_auth = server.user_auth.model_copy(update={"users": {k: _MASKED_VALUE for k in server.user_auth.users}, **masked_ua_extra})
+    masked_headers_from_context = None
+    if server.headers_from_context is not None:
+        # The declared fields hold names only and stay in cleartext — masking
+        # them would show operators `***` where a header name belongs. Extras
+        # get the same treatment as everywhere else, since `extra="allow"` lets
+        # an operator store a secret-bearing key that round-trips through PUT.
+        masked_ch_extra = {key: _MASKED_VALUE if _is_sensitive_extra_key(key) else _mask_sensitive_extra_value(value) for key, value in (server.headers_from_context.model_extra or {}).items()}
+        masked_headers_from_context = server.headers_from_context.model_copy(update=masked_ch_extra)
     masked_extra = {key: _MASKED_VALUE if _is_sensitive_extra_key(key) else _mask_sensitive_extra_value(value) for key, value in (server.model_extra or {}).items()}
     return server.model_copy(
         update={
             "env": masked_env,
             "headers": masked_headers,
             "oauth": masked_oauth,
+            "user_auth": masked_user_auth,
+            "headers_from_context": masked_headers_from_context,
             **masked_extra,
         }
     )
@@ -703,11 +816,95 @@ def _merge_preserving_secrets(
                 "refresh_token": merged_refresh_token,
             }
         )
+    merged_user_auth = incoming.user_auth
+    if incoming.user_auth is not None:
+        # Sub-field-aware merge: a partial user_auth payload (e.g. just
+        # {"enabled": false}) must not wipe the stored credential map or reset
+        # other stored sub-fields. Only sub-fields the request explicitly set
+        # replace stored values; the rest carry over — the same contract the
+        # block-level `model_fields_set` check below applies one level up.
+        incoming_ua = incoming.user_auth
+        base = existing.user_auth
+        set_fields = incoming_ua.model_fields_set
+        effective: dict[str, Any] = {}
+        if base is not None:
+            effective.update({name: getattr(base, name) for name in ("enabled", "header", "users", "on_missing")})
+            effective.update(base.model_extra or {})
+        for name in ("enabled", "header", "on_missing"):
+            if name in set_fields:
+                effective[name] = getattr(incoming_ua, name)
+        # Extras are masked by GET (see _mask_server_config), so a round-trip
+        # PUT must swap masked sentinel values back for the stored ones —
+        # the same contract server-level extras get below.
+        base_extra = (base.model_extra or {}) if base is not None else {}
+        for key, value in (incoming_ua.model_extra or {}).items():
+            effective[key] = _merge_extra_value_preserving_masked(
+                key,
+                value,
+                base_extra.get(key),
+                existing_present=key in base_extra,
+            )
+        if "users" in set_fields:
+            # An explicitly sent map replaces the stored one (so a full
+            # round-trip can remove a user), with masked values swapped back
+            # for the stored credentials.
+            existing_users = base.users if base is not None else {}
+            merged_users = {}
+            for k, v in incoming_ua.users.items():
+                if v == _MASKED_VALUE:
+                    if k in existing_users:
+                        merged_users[k] = existing_users[k]
+                    else:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Cannot set user_auth credential for '{k}' to masked value '***'; provide a real value.",
+                        )
+                else:
+                    merged_users[k] = v
+            effective["users"] = merged_users
+        merged_user_auth = McpUserScopedAuthConfigResponse(**effective)
+
+    merged_context_headers = incoming.headers_from_context
+    if incoming.headers_from_context is not None:
+        # Sub-field-aware merge, mirroring user_auth above: an explicit partial
+        # block (e.g. {"enabled": false}) must not wipe the stored mapping or
+        # reset on_missing back to its default. Only fields the request set are
+        # replaced, so an explicitly supplied ``headers`` (even {}) replaces the
+        # map while omitted fields carry over from the stored block.
+        incoming_ch = incoming.headers_from_context
+        base_ch = existing.headers_from_context
+        set_fields = incoming_ch.model_fields_set
+        effective: dict[str, Any] = {}
+        if base_ch is not None:
+            effective.update({name: getattr(base_ch, name) for name in ("enabled", "headers", "on_missing")})
+            effective.update(base_ch.model_extra or {})
+        for name in ("enabled", "headers", "on_missing"):
+            if name in set_fields:
+                effective[name] = getattr(incoming_ch, name)
+        # Extras are masked by GET (see _mask_server_config), so a round-trip
+        # PUT must swap masked sentinel values back for the stored ones — the
+        # same contract user_auth extras and server-level extras get.
+        base_ch_extra = (base_ch.model_extra or {}) if base_ch is not None else {}
+        for key, value in (incoming_ch.model_extra or {}).items():
+            effective[key] = _merge_extra_value_preserving_masked(
+                key,
+                value,
+                base_ch_extra.get(key),
+                existing_present=key in base_ch_extra,
+            )
+        merged_context_headers = McpContextHeadersConfigResponse(**effective)
+
     update = {
         "env": merged_env,
         "headers": merged_headers,
         "oauth": merged_oauth,
+        "user_auth": merged_user_auth,
+        "headers_from_context": merged_context_headers,
     }
+    if "user_auth" not in incoming.model_fields_set:
+        update["user_auth"] = existing.user_auth
+    if "headers_from_context" not in incoming.model_fields_set:
+        update["headers_from_context"] = existing.headers_from_context
     if "routing" not in incoming.model_fields_set:
         update["routing"] = existing.routing
     if "tools" not in incoming.model_fields_set:
@@ -771,27 +968,26 @@ def _apply_mcp_config_update(body: McpConfigUpdateRequest) -> dict:
     lives here too so the whole read-modify-write is a single worker hop.
     Returns the reloaded MCP server configs for the response.
     """
-    with extensions_config_write_lock:
-        # Get the current config path (or determine where to save it)
-        config_path = ExtensionsConfig.resolve_config_path()
+    # Resolve before entering the critical section so every writer locks the
+    # same sidecar path for the complete read-modify-write cycle.
+    config_path = ExtensionsConfig.resolve_config_path()
+    if config_path is None:
+        config_path = Path.cwd().parent / "extensions_config.json"
+        logger.info(f"No existing extensions config found. Creating new config at: {config_path}")
 
-        # If no config file exists, create one in the parent directory (project root)
-        if config_path is None:
-            config_path = Path.cwd().parent / "extensions_config.json"
-            logger.info(f"No existing extensions config found. Creating new config at: {config_path}")
-
-        # Load current config to preserve skills
-        current_config = get_extensions_config()
-
+    with extensions_config_write_lock, extensions_config_file_lock(config_path):
         # Load raw (un-resolved) JSON from disk to use as the merge source.
         # This preserves $VAR placeholders in env values and top-level keys
         # like mcpInterceptors that would otherwise be lost.
         raw_servers: dict[str, dict] = {}
         raw_other_keys: dict = {}
+        raw_skills: dict[str, dict] | None = None
         if config_path is not None and config_path.exists():
             with open(config_path, encoding="utf-8") as f:
                 raw_data = json.load(f)
             raw_servers = raw_data.get("mcpServers", {})
+            if isinstance(raw_data.get("skills"), dict):
+                raw_skills = raw_data["skills"]
             # Preserve any top-level keys beyond mcpServers/skills
             for key, value in raw_data.items():
                 if key not in ("mcpServers", "skills"):
@@ -812,7 +1008,10 @@ def _apply_mcp_config_update(body: McpConfigUpdateRequest) -> dict:
         # Build config data preserving all top-level keys from the original file
         config_data = dict(raw_other_keys)
         config_data["mcpServers"] = {name: server.model_dump() for name, server in merged_servers.items()}
-        config_data["skills"] = {name: {"enabled": skill.enabled} for name, skill in current_config.skills.items()}
+        if raw_skills is None:
+            current_config = get_extensions_config()
+            raw_skills = {name: {"enabled": skill.enabled} for name, skill in current_config.skills.items()}
+        config_data["skills"] = raw_skills
 
         atomic_write_extensions_config(config_path, config_data)
 
@@ -827,9 +1026,15 @@ def _apply_mcp_config_update(body: McpConfigUpdateRequest) -> dict:
 
 def _apply_mcp_server_state_update(body: McpServerStateUpdateRequest) -> dict:
     """Update one server state while preserving the raw extensions config."""
-    with extensions_config_write_lock:
-        config_path = ExtensionsConfig.resolve_config_path()
-        if config_path is None or not config_path.exists():
+    config_path = ExtensionsConfig.resolve_config_path()
+    if config_path is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"MCP server '{body.server_name}' not found",
+        )
+
+    with extensions_config_write_lock, extensions_config_file_lock(config_path):
+        if not config_path.exists():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"MCP server '{body.server_name}' not found",
