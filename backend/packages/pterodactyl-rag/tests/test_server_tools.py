@@ -142,7 +142,7 @@ async def test_build_service_validates_dim_and_wires_retriever() -> None:
     settings = Settings(
         database_url="postgresql://x",
         docs_dir=None,
-        embed_base_url=None,
+        embed_url=None,
         embed_api_key="sk-test",
         embed_model="fake",
         embed_dim=8,
@@ -164,7 +164,7 @@ async def test_build_service_without_key_disables_search() -> None:
     settings = Settings(
         database_url="postgresql://x",
         docs_dir=None,
-        embed_base_url=None,
+        embed_url=None,
         embed_api_key=None,
         embed_model="fake",
         embed_dim=8,
