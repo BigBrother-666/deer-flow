@@ -92,7 +92,7 @@ class OpenAIEmbedder:
 
     async def _embed_batch(self, batch: list[str]) -> list[list[float]]:
         client = await self._get_client()
-        url = f"{self._url}"
+        url = f"{self._url}/embeddings"
         headers = {"Authorization": f"Bearer {self._api_key}"}
         payload = {"model": self._model, "input": batch}
 
@@ -104,11 +104,10 @@ class OpenAIEmbedder:
                 last_exc = exc
             else:
                 if resp.status_code == 200:
-                    logger.info(resp.json())
-                    vecs = resp.json()["embeddings"]
-                    # # Preserve request order regardless of server ordering.
-                    # ordered = sorted(data, key=lambda d: d["index"])
-                    return vecs
+                    data = resp.json()["data"]
+                    # Preserve request order regardless of server ordering.
+                    ordered = sorted(data, key=lambda d: d["index"])
+                    return [d["embedding"] for d in ordered]
                 if resp.status_code not in _RETRYABLE_STATUS:
                     raise EmbeddingError(f"Embedding request failed [{resp.status_code}]: {resp.text[:200]}")
                 last_exc = EmbeddingError(f"retryable status {resp.status_code}")
