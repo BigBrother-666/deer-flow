@@ -110,14 +110,14 @@ async def test_exhausted_retries_raises(monkeypatch: pytest.MonkeyPatch) -> None
     ],
 )
 def test_is_local_endpoint(base_url: str, expected_local: bool) -> None:
-    emb = OpenAIEmbedder(api_key="sk", model="m", dim=3, base_url=base_url)
+    emb = OpenAIEmbedder(api_key="sk", model="m", dim=3, url=base_url)
     assert emb._is_local_endpoint() is expected_local
 
 
 async def test_local_endpoint_client_ignores_env_proxy() -> None:
     # A local endpoint must build a client that ignores ambient proxy env
     # (trust_env=False), so a socks:// ALL_PROXY can't break transport setup.
-    emb = OpenAIEmbedder(api_key="sk", model="m", dim=3, base_url="http://localhost:11434/v1")
+    emb = OpenAIEmbedder(api_key="sk", model="m", dim=3, url="http://localhost:11434/v1")
     client = await emb._get_client()
     assert client.trust_env is False
     await emb.aclose()
@@ -128,7 +128,7 @@ async def test_remote_endpoint_client_trusts_env(monkeypatch: pytest.MonkeyPatch
     # of the developer/CI shell (which may export a socks:// ALL_PROXY).
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         monkeypatch.delenv(var, raising=False)
-    emb = OpenAIEmbedder(api_key="sk", model="m", dim=3, base_url="https://api.openai.com/v1")
+    emb = OpenAIEmbedder(api_key="sk", model="m", dim=3, url="https://api.openai.com/v1")
     client = await emb._get_client()
     assert client.trust_env is True
     await emb.aclose()

@@ -102,7 +102,7 @@ class Settings:
         return cls(
             database_url=database_url,
             docs_dir=_get("PTERO_RAG_DOCS_DIR"),
-            embed_url=_get("PTERO_RAG_EMBED_URL"),
+            embed_url=_get("PTERO_RAG_EMBED_BASE_URL"),
             embed_api_key=_get("PTERO_RAG_EMBED_API_KEY"),
             embed_model=_get("PTERO_RAG_EMBED_MODEL", DEFAULT_EMBED_MODEL) or DEFAULT_EMBED_MODEL,
             embed_dim=_get_int("PTERO_RAG_EMBED_DIM", DEFAULT_EMBED_DIM),
